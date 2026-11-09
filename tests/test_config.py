@@ -93,3 +93,14 @@ def test_create_client_custom_broker_and_port(fake_mqtt_clt):
     assert call["args"][1] == 21883
     assert call["kwargs"]["use_tls"] is False
 
+
+def test_training_config_under_project_root():
+    """ 训练目录与超参数: 权重目录、输出目录、分类数与示例一致 """
+    assert config.PRE_MODEL_DIR == config.PROJECT_ROOT / "pre_model"
+    assert config.MODEL_DIR == config.PROJECT_ROOT / "model"
+    assert config.MODEL_ARCH in ("resnet18", "resnet34", "resnet50")
+    assert config.NUM_CLASSES == len(config.DATASET_CATEGORIES) == 3
+    assert config.EPOCHS > 0
+    assert 0 < config.LEARNING_RATE < 1
+    assert config.IMAGE_SIZE > 0
+

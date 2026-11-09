@@ -46,6 +46,19 @@ DATASET_SPLIT_VALID = DATASET_SPLIT_ROOT / "valid"         # 验证集目录
 PROP_TRAIN = 0.8                                           # 训练集占比, 验证集自动取剩余部分
 SPLIT_SEED = 42                                            # 随机种子, 相同数据下结果可复现; None 表示每次随机
 
+# ---------------- 模型训练 ----------------
+PRE_MODEL_DIR = PROJECT_ROOT / "pre_model"      # ImageNet 预训练权重目录
+MODEL_DIR = PROJECT_ROOT / "model"              # 训练输出目录(best.pth / last.pth / 混淆矩阵)
+MODEL_ARCH = "resnet18"                         # 可选 resnet18 / resnet34 / resnet50
+NUM_CLASSES = len(DATASET_CATEGORIES)           # 分类数, 与三类成熟度目录对应
+EPOCHS = 10                                     # 训练轮数
+BATCH_SIZE = 16                                 # 训练批大小
+VALID_BATCH_SIZE = 4                            # 验证批大小
+LEARNING_RATE = 0.0001                          # Adam 学习率
+IMAGE_SIZE = 224                                # 网络输入图片边长
+NUM_WORKERS = 0                                 # DataLoader 进程数(Windows 下建议 0)
+SEED = 0                                        # 全局随机种子
+
 # ---------------- 图像报文 ----------------
 KEY_IMAGE = "image"             # 图像报文的键, 值为 base64 编码的图片
 IMAGE_SUFFIX = ".jpg"           # 图片保存后缀

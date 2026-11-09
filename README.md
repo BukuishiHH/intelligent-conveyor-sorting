@@ -8,7 +8,7 @@
 2. **在 `on_connect` 里订阅** —— 断线重连后自动重新订阅，不会静默失聪；
 3. **发布后等投递确认** —— QoS1 + `wait_for_publish()`，避免 `publish()` 之后立即退出导致报文从未发出。
 
-在此之上还提供**数据集采集**：订阅设备上报的 base64 图片报文，落盘为 `dataset/<成熟度>/imgN.jpg`；以及**数据集划分**：按类别随机打乱后复制为 `dataset_split/train` 与 `dataset_split/valid`（见第 6 节）。
+在此之上还提供**数据集采集**：订阅设备上报的 base64 图片报文，落盘为 `dataset/<成熟度>/imgN.jpg`；**数据集划分**：按类别随机打乱后复制为 `dataset_split/train` 与 `dataset_split/valid`；以及**模型训练**：用 ResNet-18/34/50 完成训练、验证与保存（见第 6、7 节）。
 
 
 ---
@@ -19,15 +19,18 @@
 intelligent-conveyor-sorting/
 ├── conveyor/                    # 核心库（可复用）
 │   ├── __init__.py              # 导出 Mqtt_Clt 与 config
-│   ├── config.py                # 平台接入参数 + 指令常量 + 数据集/划分配置 + create_client()
+│   ├── config.py                # 平台接入参数 + 指令常量 + 数据集/划分/训练配置 + create_client()
 │   ├── dataset.py               # GetData：收 base64 图片并落盘为数据集
 │   ├── dataset_split.py         # SplitDataset：按类别随机划分 train / valid
+│   ├── resnet.py                # ResNet-18/34/50 网络定义与预训练权重加载
+│   ├── trainer.py               # ResNetTrainer：训练 / 验证 / 保存 / 混淆矩阵
 │   └── mqtt_client.py           # Mqtt_Clt：连接/订阅/发布/收报的封装
 ├── scripts/                     # 可执行入口
 │   ├── control_conveyor.py      # 传送带停止（最简示例）
 │   ├── control_rod_control.py   # 传送带运行 + 推杆往复循环
 │   ├── get_dataset.py           # 数据集采集（Ctrl+C 退出）
 │   ├── split_dataset.py         # 数据集划分（只复制不移动）
+│   ├── train_resnet.py          # ResNet 训练 / 验证 / 保存模型
 │   ├── recv_msg.py              # 收设备上报 + 下发一串动作
 │   ├── pub_mqtt.py              # 原生 paho 发布示例
 │   └── sub_mqtt.py              # 原生 paho 订阅示例
@@ -44,6 +47,12 @@ intelligent-conveyor-sorting/
 │       ├── raw/
 │       ├── ripe/
 │       └── half-ripe/
+├── pre_model/                   # ImageNet 预训练权重（运行时放置，已被 .gitignore 忽略）
+│   └── resnet18-f37072fd.pth
+├── model/                       # 训练输出（运行时生成，已被 .gitignore 忽略）
+│   ├── best.pth                 # 验证准确率最高的模型
+│   ├── last.pth                 # 最后一轮模型
+│   └── confusion_matrix.png     # 验证集混淆矩阵
 ├── tests/                       # pytest 单元测试（全部离线，不需要 broker）
 │   ├── conftest.py              # FakePahoClient 与公共 fixture
 │   ├── test_config.py
@@ -52,8 +61,11 @@ intelligent-conveyor-sorting/
 │   ├── test_control_rod_control.py
 │   ├── test_dataset.py
 │   ├── test_dataset_split.py
+│   ├── test_resnet.py
+│   ├── test_trainer.py
 │   ├── test_get_dataset.py
 │   ├── test_split_dataset.py
+│   ├── test_train_resnet.py
 │   ├── test_recv_msg.py
 │   ├── test_pub_mqtt.py
 │   └── test_sub_mqtt.py
@@ -67,28 +79,36 @@ intelligent-conveyor-sorting/
 
 | 层 | 目录 | 职责 |
 | --- | --- | --- |
-| 核心库 | `conveyor/` | 只做 MQTT 通信与参数定义，不写业务循环 |
+| 核心库 | `conveyor/` | MQTT 通信、参数定义、数据集处理与 ResNet 训练封装，不写业务循环 |
 | 入口脚本 | `scripts/` | 组装业务动作，包含 `main()` 与 `if __name__ == '__main__'` |
-| 测试 | `tests/` | 每个模块一个测试文件，用替身替代真实网络 |
+| 测试 | `tests/` | 每个模块一个测试文件，用替身替代真实网络；训练测试用小图 + CPU |
+| 运行时产物 | `dataset/`、`dataset_split/`、`pre_model/`、`model/` | 采集数据、划分结果、预训练权重、训练输出，均不提交仓库 |
 
 ---
 
 ## 2. 环境准备
 
 ```powershell
-# 建议使用虚拟环境；本项目在 Python 3.11 + paho-mqtt 2.2.0 下验证
+# 建议使用虚拟环境；本项目在 Python 3.12 + paho-mqtt 2.2.0 + torch 2.6.0 下验证
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-依赖四项：
+依赖分三组：
 
-- `paho-mqtt >= 2.0`：必须 2.x，代码使用了 `CallbackAPIVersion.VERSION2` 回调签名；
-- `numpy >= 1.20` + `opencv-python >= 4.5`：仅数据集采集需要（base64 → 图片解码/编码）；
-- `pytest >= 7.0`：仅测试需要（`pytest.ini` 用到 `pythonpath` 配置项）。
+- MQTT / 采集：`paho-mqtt >= 2.0`（必须 2.x，代码使用 `CallbackAPIVersion.VERSION2` 回调签名）、`numpy >= 1.20`、`opencv-python >= 4.5`；
+- 模型训练：`torch >= 2.0`、`torchvision >= 0.15`、`tqdm`、`matplotlib`、`seaborn`、`scikit-learn`、`torchsummary`；
+- 测试：`pytest >= 7.0`（`pytest.ini` 用到 `pythonpath` 配置项）。
 
-> 只跑控制脚本时不会 import `numpy`/`cv2`（`conveyor/__init__.py` 不导入 `dataset`），因此精简环境下也能控制设备。
+> 只跑控制脚本时不会 import `torch` / `cv2`（`conveyor/__init__.py` 不导入 `dataset` / `trainer`），因此精简环境下也能控制设备。
+
+GPU 版 PyTorch 建议先按显卡 CUDA 版本单独安装（下面以 CUDA 12.4 为例），再安装其余依赖：
+
+```powershell
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install -r requirements.txt
+```
 
 > 说明：`conveyor/` 与 `scripts/` 均在仓库根目录，**无需 `pip install` 本项目**，在仓库根目录运行即可。
 
@@ -117,6 +137,9 @@ python .\scripts\get_dataset.py
 
 # 6) 数据集划分：按类别随机打乱，8:2 复制到 dataset_split/train 与 dataset_split/valid
 python .\scripts\split_dataset.py
+
+# 7) 模型训练：加载 pre_model 下的 ResNet-18 权重，训练/验证并保存 model/best.pth
+python .\scripts\train_resnet.py
 ```
 
 也可以按模块方式运行（等价）：
@@ -206,6 +229,10 @@ ROD_FIRST_PUSH, ROD_FIRST_PULL = "first_push", "first_pull"
 | `DATASET_CATEGORIES` | 参与划分的类别目录名（`half-ripe` / `raw` / `ripe`） |
 | `DATASET_SPLIT_ROOT` / `DATASET_SPLIT_TRAIN` / `DATASET_SPLIT_VALID` | 划分结果目录（`dataset_split/train`、`dataset_split/valid`） |
 | `PROP_TRAIN` / `SPLIT_SEED` | 训练集占比（`0.8`）与随机种子（`42`） |
+| `PRE_MODEL_DIR` / `MODEL_DIR` | 预训练权重目录（`pre_model/`）与训练输出目录（`model/`） |
+| `MODEL_ARCH` / `NUM_CLASSES` | 网络结构（`resnet18`）与分类数（3） |
+| `EPOCHS` / `BATCH_SIZE` / `VALID_BATCH_SIZE` | 训练轮数（10）、训练批大小（16）、验证批大小（4） |
+| `LEARNING_RATE` / `IMAGE_SIZE` / `NUM_WORKERS` / `SEED` | Adam 学习率（`1e-4`）、输入边长（224）、DataLoader 进程数（0）、随机种子（0） |
 | `create_client(...)` | 按平台默认参数创建 `Mqtt_Clt`；`use_websocket=False` 时自动走 1883 明文并关闭 TLS |
 
 ```python
@@ -420,7 +447,139 @@ splitter = SplitDataset(prop_train=config.PROP_TRAIN, seed=config.SPLIT_SEED)
 summary = splitter.run()
 ```
 
-## 7. 测试
+## 7. 模型训练（ResNet）
+
+`conveyor/resnet.py` 定义网络，`conveyor/trainer.py` 封装训练/验证/评估，`scripts/train_resnet.py` 是命令行入口。
+数据来自第 6 节划分出的 `dataset_split/train` 与 `dataset_split/valid`，预训练权重放在 `pre_model/`。
+
+### 7.1 网络结构
+
+| 名称 | 说明 |
+| --- | --- |
+| `BasicBlock` | ResNet-18/34 的基础残差块：两层 3x3 卷积 + shortcut，`expansion = 1` |
+| `Bottleneck` | ResNet-50 的瓶颈残差块：1x1 → 3x3 → 1x1，`expansion = 4` |
+| `ResNet` | 主干（conv1 + 4 个 stage）+ 全局平均池化 + 全连接分类头 |
+| `resnet18/34/50(num_classes=1000)` | 三个标准结构，分类数可改 |
+| `create_resnet(arch, num_classes)` | 按名称创建，`arch` 仅支持 `resnet18/34/50` |
+| `load_pretrained(model, weight_path)` | 严格加载 ImageNet 权重；文件不存在时打印提示并返回 `False` |
+
+Bottleneck 采用 **ResNet v1.5** 写法：第一个 1x1 卷积步距为 1，由 3x3 卷积承担 `stride`。
+训练时先构建 1000 类模型加载 ImageNet 权重，再把 `model.fc` 替换为 `nn.Linear(512 * expansion, 3)`，输出三类成熟度。
+
+### 7.2 预训练权重
+
+| 结构 | 文件名 | 官方地址 |
+| --- | --- | --- |
+| ResNet-18 | `resnet18-f37072fd.pth` | <https://download.pytorch.org/models/resnet18-f37072fd.pth> |
+| ResNet-34 | `resnet34-333f7ec4.pth` | <https://download.pytorch.org/models/resnet34-333f7ec4.pth> |
+| ResNet-50 | `resnet50-19c8e357.pth` | <https://download.pytorch.org/models/resnet50-19c8e357.pth> |
+
+```powershell
+# 以 ResNet-18 为例，保存到 pre_model/resnet18-f37072fd.pth
+Invoke-WebRequest -Uri https://download.pytorch.org/models/resnet18-f37072fd.pth `
+    -OutFile .\pre_model\resnet18-f37072fd.pth
+```
+
+- 文件名与 `conveyor/resnet.py` 的 `PRETRAINED_WEIGHTS` 一一对应；
+- `pre_model/` 已被 `.gitignore` 忽略，换机器时需重新下载或拷贝；
+- 权重缺失时训练不会中断，会打印“预训练权重不存在, 使用随机初始化”后从零训练；
+- 需要显式从零训练时加 `--no-pretrained`，不读取权重文件。
+
+### 7.3 训练与验证流程
+
+1. `setup_seed(SEED)` 固定 Python / Numpy / PyTorch / CUDA 种子，并设置 cudnn 为确定性算法；
+2. 训练集：`RandomResizedCrop(224)` + `RandomHorizontalFlip` + `ToTensor` + ImageNet 均值方差归一化；
+3. 验证集：`Resize((224, 224))` + `ToTensor` + 同样的归一化；
+4. 损失函数 `CrossEntropyLoss`，优化器 `Adam(lr=1e-4)`；
+5. 每个 epoch 训练后验证；验证准确率**严格高于历史最优**时保存 `model/best.pth`，每轮结束保存 `model/last.pth`；
+6. 训练结束后载入 `best.pth`，在验证集上计算最终准确率，并用 seaborn 绘制混淆矩阵到 `model/confusion_matrix.png`。
+
+指标按样本数平均：`loss = 累计 loss / 数据集张数`，`acc = 预测正确数 / 数据集张数`。
+
+### 7.4 命令行参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--data-root` | `dataset_split` | 划分后的数据集根目录（其下含 `train/`、`valid/`） |
+| `--pre-model` | `pre_model` | ImageNet 预训练权重目录 |
+| `--model-dir` | `model` | 输出目录（`best.pth` / `last.pth` / 混淆矩阵） |
+| `--arch` | `resnet18` | `resnet18` / `resnet34` / `resnet50` |
+| `--epochs` | `10` | 训练轮数 |
+| `--batch-size` | `16` | 训练批大小 |
+| `--valid-batch-size` | `4` | 验证批大小 |
+| `--lr` | `0.0001` | Adam 学习率 |
+| `--image-size` | `224` | 输入图片边长 |
+| `--num-workers` | `0` | DataLoader 进程数（Windows 建议 0） |
+| `--seed` | `0` | 全局随机种子 |
+| `--device` | `auto` | `auto` / `cpu` / `cuda`，默认有 GPU 用 GPU |
+| `--no-pretrained` | 关闭 | 不加载预训练权重，从随机初始化开始训练 |
+
+### 7.5 运行与输出
+
+```powershell
+# 先完成数据集划分（第 6 节），再训练
+python .\scripts\split_dataset.py
+python .\scripts\train_resnet.py
+
+# 换 ResNet-34、20 轮、指定 GPU
+python .\scripts\train_resnet.py --arch resnet34 --epochs 20 --device cuda
+
+# 小图快速联调（不加载预训练）
+python .\scripts\train_resnet.py --image-size 64 --epochs 1 --batch-size 4 --no-pretrained
+```
+
+训练完成后输出：
+
+```text
+训练完成, 验证集准确率: 100.00%
+最优模型: D:\...\model\best.pth
+混淆矩阵: D:\...\model\confusion_matrix.png
+```
+
+### 7.6 当前训练结果
+
+当前 `dataset_split/` 共 753 张（train 600 / valid 153），ResNet-18 + ImageNet 预训练，Adam `1e-4`，batch 16，输入 224，CPU 训练 10 轮：
+
+| epoch | train_loss | train_acc | val_loss | val_acc |
+| --- | --- | --- | --- | --- |
+| 1 | 0.021 | 0.862 | 0.028 | 0.954 |
+| 2 | 0.010 | 0.938 | 0.004 | **1.000** |
+| 3 | 0.005 | 0.967 | 0.003 | 1.000 |
+| 4 | 0.004 | 0.978 | 0.004 | 1.000 |
+| 5 | 0.006 | 0.960 | 0.001 | 1.000 |
+| 6 | 0.005 | 0.968 | 0.001 | 1.000 |
+| 7 | 0.005 | 0.970 | 0.000 | 1.000 |
+| 8 | 0.003 | 0.977 | 0.000 | 1.000 |
+| 9 | 0.004 | 0.977 | 0.000 | 1.000 |
+| 10 | 0.003 | 0.987 | 0.000 | 1.000 |
+
+- 最优模型出现在第 2 轮（`val_acc = 1.000`），最终载入 `best.pth` 复评，153 张验证图全部预测正确；
+- 混淆矩阵对角线为 51 / 51 / 51，保存于 `model/confusion_matrix.png`；
+- CPU（torch 2.6.0+cpu）单轮约 40 秒，10 轮数分钟完成；使用 CUDA 会更快。
+
+> 验证集只有 153 张且与训练集同批次采集，100% 准确率只说明当前数据可分，**不代表跨批次泛化能力**；上线前应补充新批次数据复测。
+
+### 7.7 API：`conveyor.trainer.ResNetTrainer`
+
+| 成员 | 说明 |
+| --- | --- |
+| `ResNetTrainer(data_root, pre_model_dir, model_dir, arch, epochs, batch_size, valid_batch_size, lr, image_size, num_workers, seed, device=None, pretrained=True, verbose=True)` | 记录训练参数；`device=None` 时自动选择 GPU/CPU |
+| `setup()` | 固定种子，构建数据集、DataLoader、模型、损失函数与优化器 |
+| `build_model(num_classes)` | 创建 ResNet、加载预训练权重、替换 `fc` 并移到设备 |
+| `fit()` | 逐轮训练/验证并保存 `best.pth`、`last.pth`，返回每轮指标列表 |
+| `evaluate(load_best=True)` | 载入最优模型，返回 `accuracy` / `confusion_matrix` / 标签 |
+| `run()` | 完整流程，返回训练历史、准确率、模型路径与混淆矩阵路径 |
+
+```python
+from conveyor import config
+from conveyor.trainer import ResNetTrainer
+
+trainer = ResNetTrainer(epochs=10, device="cuda", pretrained=True)
+result = trainer.run()
+print(result["accuracy"], result["best_model"])
+```
+
+## 8. 测试
 
 测试只依赖 `pytest`，**全部离线运行**：`tests/conftest.py` 里的 `FakePahoClient` 替换了 `paho.mqtt.client.Client`，
 并让 `loop_start()` 立即回调 `on_connect`（模拟 broker 返回 CONNACK），因此不需要网络、不会向设备发指令。
@@ -439,7 +598,7 @@ python -m pytest -v
 
 | 测试文件 | 覆盖内容 |
 | --- | --- |
-| `test_config.py` | 常量取值正确；`create_client` 的参数映射（wss/明文、TLS 跟随、主题与 client_id 透传） |
+| `test_config.py` | 常量取值正确；`create_client` 的参数映射（wss/明文、TLS 跟随、主题与 client_id 透传）；训练目录与超参数 |
 | `test_mqtt_client.py` | 传输与 TLS 选项、CONNACK 等待、超时/拒绝异常、on_connect 订阅、client_id 唯一性、JSON 发布参数与确认、消息解析/队列满/解析失败、断线与关闭顺序 |
 | `test_control_conveyor.py` | 下发 `conveyor=stop`、送达/未送达提示、异常时仍关闭连接、"结束"输出 |
 | `test_control_rod_control.py` | 先 `conveyor=run` 再 `rod_control=first_push`、Ctrl+C 退出与关闭 |
@@ -448,16 +607,21 @@ python -m pytest -v
 | `test_sub_mqtt.py` | 订阅 `lzm1`、连接失败不订阅、消息打印、`loop_forever` 中断后断开 |
 | `test_dataset.py` | 目录创建/复用、序号续接、base64 解码落盘、非图像报文跳过、坏数据/编码/写入失败、线程收发与关闭、真实 opencv 往返 |
 | `test_dataset_split.py` | 配置默认值、按类别 8:2 切分与源文件不变、打乱/种子复现、清空与 `--keep`、缺类/空类/非法占比/目录重叠校验 |
+| `test_resnet.py` | BasicBlock/Bottleneck 的 `expansion`、ResNet v1.5 步距、18/34/50 结构与前向输出、`create_resnet` 非法结构、权重文件映射、缺失权重回退、state_dict 存取往返 |
+| `test_trainer.py` | ImageFolder/DataLoader 装配、类别一致性校验、预训练权重路径、固定种子复现、CPU 小图完整训练并检查 best/last/混淆矩阵、评估准确率 |
 | `test_get_dataset.py` | 默认参数、命令行覆盖（本地 broker/tcp）、`create_client` 装配、Ctrl+C 与异常时关闭采集器 |
 | `test_split_dataset.py` | 默认与自定义命令行参数、`SplitDataset` 装配、`--seed -1` 与 `--keep` 映射 |
+| `test_train_resnet.py` | 默认/自定义命令行参数、`ResNetTrainer` 装配、`auto` 设备与 `--no-pretrained` 映射 |
 
-当前结果：**82 passed**。
+当前结果：**103 passed**。
+
+> 训练相关测试使用 3 类、每类 4 张训练图 + 2 张验证图的合成小图，在 CPU 上跑完 1 个 epoch，**不需要 GPU、真实数据集或网络**。
 
 > 测试替身只模拟行为、不校验真实 broker 语义；真实链路仍需用 `control_conveyor.py` + MQTTX 联合验证。
 
 ---
 
-## 8. MQTTX 客户端配置
+## 9. MQTTX 客户端配置
 
 想用图形客户端观察报文，必须配对协议，否则连不上 9002：
 
@@ -478,7 +642,7 @@ python -m pytest -v
 
 ---
 
-## 9. 故障排查
+## 10. 故障排查
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
@@ -494,6 +658,13 @@ python -m pytest -v
 | 提示"图片解码失败, 已跳过该报文" | base64 解出来不是图片（如 URL、纯文本、二次编码） | 让设备端先 JPEG/PNG 编码再 base64，只编码一次 |
 | 采集图片不全 / 频繁"消息队列满" | 图片体积大、落盘慢，`queue.Queue(5)` 溢出 | 降低设备推送频率，或调大 `Mqtt_Clt` 的队列容量（会占更多内存） |
 | 报错"源数据集缺少类别目录" | `dataset/` 下三类目录不全 | 补齐 `dataset/raw`、`dataset/ripe`、`dataset/half-ripe` 后再划分 |
+| `ModuleNotFoundError: No module named 'torch'` | 只装了 MQTT/采集依赖，未装训练依赖 | `pip install -r requirements.txt`；GPU 版按第 2 节用 cu124 源单独安装 |
+| 训练日志提示“预训练权重不存在, 使用随机初始化” | `pre_model/` 下没有对应文件或文件名不符 | 按 7.2 节下载到 `pre_model/resnet18-f37072fd.pth`；确认 `--arch` 与文件名匹配 |
+| 加载权重报 `size mismatch for fc.weight` | 权重不是官方 1000 类 ImageNet 权重 | 使用 7.2 节的官方权重；或加 `--no-pretrained` 从零训练 |
+| `--device cuda` 报 `Torch not compiled with CUDA enabled` | 安装的是 CPU 版 torch | 按第 2 节安装 CUDA 轮子，或改用 `--device cpu` |
+| CUDA out of memory | batch 太大或显存被其他进程占用 | 降低 `--batch-size`（如 8/4）或 `--image-size`，关闭占用显存的程序 |
+| 训练很慢 | 用 CPU 训练、`num_workers=0`、图片被放大到 224 | 优先用 GPU；Windows 下可试 `--num-workers 2`；小图联调可 `--image-size 64` |
+| 报错“train 与 valid 类别不一致” | 两次划分使用了不同类别集合，或手工增删了类别目录 | 重新执行 `python .\scripts\split_dataset.py`，确保两边目录完全一致 |
 | train / valid 中出现同名图片 | 上一次划分的旧文件残留，或用了 `--keep` 追加不同批次 | 默认会清空 `dataset_split/`；跨批次划分时不要用 `--keep` |
 
 自检顺序（推荐）：
@@ -503,9 +674,15 @@ python -m pytest -v
 3. `python .\scripts\sub_mqtt.py` 观察 `lzm1` —— 有上报说明设备在线，可继续测试 `run` / `first_push`；
 4. 设备无任何上报时，问题在设备侧（在线状态、broker 地址、端口协议），与上位机脚本无关。
 
+模型训练自检：
+
+1. `python -m pytest tests\test_resnet.py tests\test_trainer.py` —— 不依赖 GPU / 真实数据，先确认网络与训练流程正常；
+2. `python .\scripts\train_resnet.py --epochs 1` —— 观察是否打印“已加载预训练权重”并生成 `model/best.pth`；
+3. 查看 `model/confusion_matrix.png`，三类若严重偏向某一类，优先检查数据集类别是否均衡、标签目录是否放错。
+
 ---
 
-## 10. 从旧版本迁移
+## 11. 从旧版本迁移
 
 早期版本是根目录平铺的脚本，重构后对应关系如下：
 
@@ -518,6 +695,10 @@ python -m pytest -v
 | `pub_mqtt.py` | `scripts/pub_mqtt.py` |
 | `sub_mqtt.py` | `scripts/sub_mqtt.py` |
 | `hqyj_mqtt` 示例中的 `GetData`（外部教学代码） | `conveyor/dataset.py` + `scripts/get_dataset.py` |
+| `ResNet.py` | `conveyor/resnet.py`（类名 `BasicBlock` / `Bottleneck` / `ResNet` 不变） |
+| 训练/验证脚本（根目录） | `conveyor/trainer.py` + `scripts/train_resnet.py` |
+| `./dataset_peach/train`、`./dataset_peach/valid` | `config.DATASET_SPLIT_ROOT`（默认 `dataset_split/train`、`dataset_split/valid`） |
+| `./pre_model/*.pth`、`./model/*.pth` | 目录不变，但已被 `.gitignore` 忽略 |
 
 导入方式变化：
 
@@ -534,7 +715,7 @@ from conveyor import config
 
 ---
 
-## 11. 设计要点与已知限制
+## 12. 设计要点与已知限制
 
 设计要点：
 
@@ -545,6 +726,11 @@ from conveyor import config
 - **唯一 client_id**：避免同 ID 客户端互踢，导致"时而收得到、时而收不到"。
 - **采集线程**：`GetData` 用 daemon 线程 + `stop_event` 消费 `mqtt_queue`，`close()` 先停线程再断 MQTT，避免写出半张图片。
 - **可复现划分**：`SplitDataset` 用独立的 `random.Random(seed)` 打乱，固定种子即可复现同一份 train / valid；默认先清空输出目录，避免旧文件残留造成训练/验证数据泄漏。
+- **预训练 + 换头**：ResNet 先按 1000 类加载 ImageNet 权重，再把 `fc` 换成 3 类线性层，既复用特征又避免类别数不匹配。
+- **保存策略**：第一轮无条件保存 `best.pth`（初始最优值设为 `-1`），之后仅当验证准确率严格提升才覆盖；每轮都更新 `last.pth`，便于对比过拟合。
+- **可复现训练**：`setup_seed()` 同时固定 Python / Numpy / PyTorch / CUDA 种子，并设置 cudnn deterministic；DataLoader 训练集打乱、验证集保持顺序。
+- **验证集预处理**：只做 `Resize + Normalize`，不引入随机裁剪/翻转，保证每轮评估口径一致。
+- **产物隔离**：`pre_model/`、`model/` 与数据集一样被 `.gitignore` 忽略，仓库只保留代码与权重下载地址。
 - **中文路径**：图片落盘用 `cv2.imencode()` + `Path.write_bytes()`；`cv2.imwrite()` / `cv2.imread()` 在 Windows 中文路径下会静默失败。
 
 已知限制：
@@ -552,14 +738,20 @@ from conveyor import config
 - 未实现持久会话（`clean_session=False` / `session_expiry`），断线期间下发的 QoS1 报文不会补发；
 - `retain` 默认关闭，指令不会被 broker 保留给后上线的设备（旧用例中 `lzm0` 存在一条历史 retained 报文，测试时可能先收到它）；
 - 未做 TLS 证书固定（pinning）与双向认证，仅依赖系统 CA 校验服务端证书；
-- 设备侧行为（是否执行、执行结果）不在本仓库范围内，需结合设备固件与平台日志排查。
+- 设备侧行为（是否执行、执行结果）不在本仓库范围内，需结合设备固件与平台日志排查；
+- 训练只支持单标签三分类与固定输入尺寸，未实现早停、学习率调度、混合精度、k 折交叉验证；
+- 当前验证集与训练集同批次采集且仅 153 张，100% 准确率不代表跨批次泛化能力；
+- 未导出 TorchScript / ONNX，也未把模型接入实时分拣推理（后续可在 `scripts/` 增加预测入口）。
 
 ---
 
-## 12. 参考
+## 13. 参考
 
 - paho-mqtt 官方文档：<https://eclipse.dev/paho/files/paho.mqtt.python/html/index.html>
 - MQTT 5.0 规范：<https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html>
 - WebSocket（RFC 6455）：<https://datatracker.ietf.org/doc/html/rfc6455>
+- ResNet 论文（Deep Residual Learning for Image Recognition）：<https://arxiv.org/abs/1512.03385>
+- PyTorch ResNet 实现：<https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py>
+- PyTorch 官方预训练权重：<https://download.pytorch.org/models/resnet18-f37072fd.pth>
 
 

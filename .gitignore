@@ -8,3 +8,5 @@ venv/
 *.log
 dataset/
 dataset_split/
+pre_model/
+model/
