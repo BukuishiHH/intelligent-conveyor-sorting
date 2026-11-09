@@ -70,3 +70,26 @@ def test_create_client_custom_topics_and_id(fake_mqtt_clt):
     assert call["args"][2] == "sub_topic"
     assert call["args"][3] == "pub_topic"
     assert call["kwargs"]["client_id"] == "my-id"
+
+
+def test_dataset_folders_under_project_root():
+    """ 数据集目录固定在项目根下, 与运行时所在目录无关 """
+    assert config.DATASET_ROOT == config.PROJECT_ROOT / "dataset"
+    assert config.DATASET_RAW == config.DATASET_ROOT / "raw"
+    assert config.DATASET_RIPE == config.DATASET_ROOT / "ripe"
+    assert config.DATASET_HALF_RIPE == config.DATASET_ROOT / "half-ripe"
+
+
+def test_image_message_constants():
+    assert config.KEY_IMAGE == "image"
+    assert config.IMAGE_SUFFIX == ".jpg"
+
+
+def test_create_client_custom_broker_and_port(fake_mqtt_clt):
+    """ 本地采集时可覆盖 broker 与端口(如 127.0.0.1:21883) """
+    config.create_client(broker="127.0.0.1", port=21883, use_websocket=False)
+    call = fake_mqtt_clt[0]
+    assert call["args"][0] == "127.0.0.1"
+    assert call["args"][1] == 21883
+    assert call["kwargs"]["use_tls"] is False
+

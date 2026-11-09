@@ -8,6 +8,9 @@
 2. **在 `on_connect` 里订阅** —— 断线重连后自动重新订阅，不会静默失聪；
 3. **发布后等投递确认** —— QoS1 + `wait_for_publish()`，避免 `publish()` 之后立即退出导致报文从未发出。
 
+在此之上还提供**数据集采集**：订阅设备上报的 base64 图片报文，落盘为 `dataset/<成熟度>/imgN.jpg`（见第 6 节）。
+
+
 ---
 
 ## 1. 目录结构
@@ -16,20 +19,28 @@
 intelligent-conveyor-sorting/
 ├── conveyor/                    # 核心库（可复用）
 │   ├── __init__.py              # 导出 Mqtt_Clt 与 config
-│   ├── config.py                # 平台接入参数 + 指令常量 + create_client()
+│   ├── config.py                # 平台接入参数 + 指令常量 + 数据集目录 + create_client()
+│   ├── dataset.py               # GetData：收 base64 图片并落盘为数据集
 │   └── mqtt_client.py           # Mqtt_Clt：连接/订阅/发布/收报的封装
 ├── scripts/                     # 可执行入口
 │   ├── control_conveyor.py      # 传送带停止（最简示例）
 │   ├── control_rod_control.py   # 传送带运行 + 推杆往复循环
+│   ├── get_dataset.py           # 数据集采集（Ctrl+C 退出）
 │   ├── recv_msg.py              # 收设备上报 + 下发一串动作
 │   ├── pub_mqtt.py              # 原生 paho 发布示例
 │   └── sub_mqtt.py              # 原生 paho 订阅示例
+├── dataset/                     # 采集输出（运行时生成，已被 .gitignore 忽略）
+│   ├── raw/                     # 未成熟
+│   ├── ripe/                    # 成熟
+│   └── half-ripe/               # 半成熟
 ├── tests/                       # pytest 单元测试（全部离线，不需要 broker）
 │   ├── conftest.py              # FakePahoClient 与公共 fixture
 │   ├── test_config.py
 │   ├── test_mqtt_client.py
 │   ├── test_control_conveyor.py
 │   ├── test_control_rod_control.py
+│   ├── test_dataset.py
+│   ├── test_get_dataset.py
 │   ├── test_recv_msg.py
 │   ├── test_pub_mqtt.py
 │   └── test_sub_mqtt.py
@@ -58,10 +69,13 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-依赖仅两项：
+依赖四项：
 
 - `paho-mqtt >= 2.0`：必须 2.x，代码使用了 `CallbackAPIVersion.VERSION2` 回调签名；
+- `numpy >= 1.20` + `opencv-python >= 4.5`：仅数据集采集需要（base64 → 图片解码/编码）；
 - `pytest >= 7.0`：仅测试需要（`pytest.ini` 用到 `pythonpath` 配置项）。
+
+> 只跑控制脚本时不会 import `numpy`/`cv2`（`conveyor/__init__.py` 不导入 `dataset`），因此精简环境下也能控制设备。
 
 > 说明：`conveyor/` 与 `scripts/` 均在仓库根目录，**无需 `pip install` 本项目**，在仓库根目录运行即可。
 
@@ -84,6 +98,9 @@ python .\scripts\recv_msg.py
 # 4) 原生 paho 示例：发布一条文本消息 / 订阅设备上报
 python .\scripts\pub_mqtt.py
 python .\scripts\sub_mqtt.py
+
+# 5) 数据集采集：收设备上报的 base64 图片，存到 dataset/raw（Ctrl+C 退出）
+python .\scripts\get_dataset.py
 ```
 
 也可以按模块方式运行（等价）：
@@ -225,7 +242,100 @@ finally:
 
 ---
 
-## 6. 测试
+## 6. 数据集采集
+
+`scripts/get_dataset.py` 把设备上报的 base64 图片落盘成数据集，供后续训练/评估使用。
+
+### 6.1 报文与保存规则
+
+设备向订阅主题发送（JSON）：
+
+```json
+{"image": "<base64 编码的图片字节>"}
+```
+
+落盘规则：
+
+- 目录不存在时**自动创建**（默认 `dataset/raw`，已被 `.gitignore` 忽略）；
+- 文件名 `img0.jpg`、`img1.jpg` …… 递增；
+- 启动时扫描目录里已有的 `img*.jpg`，**从下一个序号继续**，重复运行不会覆盖历史数据；
+- 非 `image` 报文（如 `{"conveyor": "run"}`）直接跳过，不占用序号；
+- 解码 / 编码 / 写入失败只打印提示并跳过当前报文，接收线程不会退出。
+
+### 6.2 命令行参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--host` | `mqtt.yyzlab.com.cn` | broker 地址 |
+| `--port` | 按 `--transport` 取 `9002` / `1883` | broker 端口 |
+| `--sub` | `lzm1` | 订阅主题（图片上报） |
+| `--pub` | `lzm0` | 发布主题（采集脚本不主动发指令） |
+| `--transport` | `wss` | `wss` = WebSocket + TLS；`tcp` = 明文 MQTT |
+| `--folder` | `dataset/raw` | 图片保存目录 |
+
+三类成熟度目录已在 `conveyor/config.py` 定义：`DATASET_RAW` / `DATASET_RIPE` / `DATASET_HALF_RIPE`，采集不同批次时用 `--folder` 指定。
+
+### 6.3 运行
+
+```powershell
+# 平台默认 wss 9002，保存到 dataset/raw
+python .\scripts\get_dataset.py
+
+# 保存到成熟果实目录
+python .\scripts\get_dataset.py --folder .\dataset\ripe
+
+# 本地 broker + 明文端口（示例代码里的 127.0.0.1:21883，主题 bb -> aa）
+python .\scripts\get_dataset.py --host 127.0.0.1 --port 21883 --transport tcp `
+    --sub bb --pub aa --folder .\dataset\raw
+```
+
+收到图片时输出：
+
+```text
+开始接收图片, 保存目录: D:\...\dataset\raw, 按 Ctrl+C 退出
+图片0已保存: D:\...\dataset\raw\img0.jpg
+```
+
+按 `Ctrl+C` 停止：脚本会先等接收线程退出，再 `close()` 断开 MQTT。
+
+### 6.4 API：`conveyor.dataset.GetData`
+
+| 成员 | 说明 |
+| --- | --- |
+| `GetData(mqtt_client, folder_path, image_key="image")` | 创建目录、计算起始序号、启动接收线程 |
+| `save_image(image_base64)` | 解码并保存一张图片，成功返回 `Path`，失败返回 `None` |
+| `make_dir(folder_path)` | 目录不存在时递归创建 |
+| `next_index()` | 扫描 `img*.jpg`，返回下一个可用序号 |
+| `close()` | 停止接收线程（`join` 最长 2 s）并关闭 MQTT 连接 |
+| `count` / `t_recv_data` / `folder_path` | 当前序号 / 接收线程 / 保存目录 |
+
+```python
+from conveyor import config
+from conveyor.dataset import GetData
+
+mqtt_client = config.create_client()                 # 已连接并订阅 lzm1
+collector = GetData(mqtt_client, config.DATASET_RAW)
+try:
+    ...                                              # 主线程做别的事，图片由子线程落盘
+finally:
+    collector.close()
+```
+
+### 6.5 与原始示例代码的差异
+
+原始示例在类里自建 `Mqtt_Clt` 并 `while True` 阻塞取队列，整合时做了 5 处调整：
+
+| 原示例 | 本项目 | 原因 |
+| --- | --- | --- |
+| 类内自建 `Mqtt_Clt` | 由调用方注入 `mqtt_client` | 统一走 `config.create_client()`，wss/TLS 参数不重复，也便于测试替身 |
+| `while True` + 阻塞 `get()` | `stop_event` + `get(timeout=0.5)` | 有可控退出点，`close()` 能停线程，进程不会卡死 |
+| `cv2.imwrite(path, image)` | `cv2.imencode()` + `Path.write_bytes()` | **Windows 下 `cv2.imwrite` 不支持中文路径**（本项目路径含中文，会静默写失败） |
+| `img{i}.jpg` 从 0 开始 | 扫描已有文件续号 | 重复采集不覆盖历史数据 |
+| 无异常处理 | 解码 / 编码 / 写入分别捕获并跳过 | 一条坏报文不会终止整个采集线程 |
+
+> `numpy`、`opencv-python` 只在采集时需要；采集产物位于 `dataset/`，已被 `.gitignore` 忽略，不会误提交。
+
+## 7. 测试
 
 测试只依赖 `pytest`，**全部离线运行**：`tests/conftest.py` 里的 `FakePahoClient` 替换了 `paho.mqtt.client.Client`，
 并让 `loop_start()` 立即回调 `on_connect`（模拟 broker 返回 CONNACK），因此不需要网络、不会向设备发指令。
@@ -251,14 +361,16 @@ python -m pytest -v
 | `test_recv_msg.py` | 收报打印与线程退出、动作下发顺序、Ctrl+C 清理 |
 | `test_pub_mqtt.py` | 原生客户端 wss 配置、连接回调输出、发布参数与等待确认、断开顺序 |
 | `test_sub_mqtt.py` | 订阅 `lzm1`、连接失败不订阅、消息打印、`loop_forever` 中断后断开 |
+| `test_dataset.py` | 目录创建/复用、序号续接、base64 解码落盘、非图像报文跳过、坏数据/编码/写入失败、线程收发与关闭、真实 opencv 往返 |
+| `test_get_dataset.py` | 默认参数、命令行覆盖（本地 broker/tcp）、`create_client` 装配、Ctrl+C 与异常时关闭采集器 |
 
-当前结果：**39 passed**。
+当前结果：**62 passed**。
 
 > 测试替身只模拟行为、不校验真实 broker 语义；真实链路仍需用 `control_conveyor.py` + MQTTX 联合验证。
 
 ---
 
-## 7. MQTTX 客户端配置
+## 8. MQTTX 客户端配置
 
 想用图形客户端观察报文，必须配对协议，否则连不上 9002：
 
@@ -279,7 +391,7 @@ python -m pytest -v
 
 ---
 
-## 8. 故障排查
+## 9. 故障排查
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
@@ -291,6 +403,9 @@ python -m pytest -v
 | 订阅 `lzm1` 完全没有报文 | 设备端可能把 9002 当成明文 TCP 端口在连 | 让设备改用 1883，或改用 `wss` + `/mqtt` |
 | 两个程序互相顶号掉线 | 早期版本 client_id 为空或重复 | 现在默认 `hq007_<uuid12>`，也可显式传 `client_id` |
 | 收报队列满，提示"消息队列满, 丢弃报文" | `queue.Queue(5)` 已满，消费线程太慢 | 在 `recv_msg.get_message()` 中加快消费，或调大队列容量 |
+| 采集脚本一直收不到图片 | 设备未上报，或报文里没有 `image` 键 | 先用 `python .\scripts\sub_mqtt.py` 看 `lzm1` 原始报文，确认键名与 base64 内容 |
+| 提示"图片解码失败, 已跳过该报文" | base64 解出来不是图片（如 URL、纯文本、二次编码） | 让设备端先 JPEG/PNG 编码再 base64，只编码一次 |
+| 采集图片不全 / 频繁"消息队列满" | 图片体积大、落盘慢，`queue.Queue(5)` 溢出 | 降低设备推送频率，或调大 `Mqtt_Clt` 的队列容量（会占更多内存） |
 
 自检顺序（推荐）：
 
@@ -301,7 +416,7 @@ python -m pytest -v
 
 ---
 
-## 9. 从旧版本迁移
+## 10. 从旧版本迁移
 
 早期版本是根目录平铺的脚本，重构后对应关系如下：
 
@@ -313,6 +428,7 @@ python -m pytest -v
 | `recv_msg.py` | `scripts/recv_msg.py` |
 | `pub_mqtt.py` | `scripts/pub_mqtt.py` |
 | `sub_mqtt.py` | `scripts/sub_mqtt.py` |
+| `hqyj_mqtt` 示例中的 `GetData`（外部教学代码） | `conveyor/dataset.py` + `scripts/get_dataset.py` |
 
 导入方式变化：
 
@@ -329,7 +445,7 @@ from conveyor import config
 
 ---
 
-## 10. 设计要点与已知限制
+## 11. 设计要点与已知限制
 
 设计要点：
 
@@ -338,6 +454,8 @@ from conveyor import config
 - **关闭顺序**：`disconnect()` → `loop_stop()`，先发 DISCONNECT 让 broker 正常清理会话，再停网络线程。
 - **队列解耦**：`on_message` 只做解析入队，业务线程通过 `mqtt_queue` 消费，避免阻塞 paho 网络线程。
 - **唯一 client_id**：避免同 ID 客户端互踢，导致"时而收得到、时而收不到"。
+- **采集线程**：`GetData` 用 daemon 线程 + `stop_event` 消费 `mqtt_queue`，`close()` 先停线程再断 MQTT，避免写出半张图片。
+- **中文路径**：图片落盘用 `cv2.imencode()` + `Path.write_bytes()`；`cv2.imwrite()` / `cv2.imread()` 在 Windows 中文路径下会静默失败。
 
 已知限制：
 
@@ -348,7 +466,7 @@ from conveyor import config
 
 ---
 
-## 11. 参考
+## 12. 参考
 
 - paho-mqtt 官方文档：<https://eclipse.dev/paho/files/paho.mqtt.python/html/index.html>
 - MQTT 5.0 规范：<https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html>
