@@ -59,6 +59,11 @@ IMAGE_SIZE = 224                                # 网络输入图片边长
 NUM_WORKERS = 0                                 # DataLoader 进程数(Windows 下建议 0)
 SEED = 0                                        # 全局随机种子
 
+# ---------------- 单图推理 ----------------
+# 类别顺序必须与训练时 ImageFolder 的目录排序一致(按名称升序), 否则预测结果会错位
+PREDICT_MODEL = MODEL_DIR / "best.pth"              # 单图推理默认加载的权重
+PREDICT_RESULT = MODEL_DIR / "predict_result.png"   # 单图推理可视化的默认输出
+
 # ---------------- 图像报文 ----------------
 KEY_IMAGE = "image"             # 图像报文的键, 值为 base64 编码的图片
 IMAGE_SUFFIX = ".jpg"           # 图片保存后缀
