@@ -8,7 +8,7 @@
 2. **在 `on_connect` 里订阅** —— 断线重连后自动重新订阅，不会静默失聪；
 3. **发布后等投递确认** —— QoS1 + `wait_for_publish()`，避免 `publish()` 之后立即退出导致报文从未发出。
 
-在此之上还提供**数据集采集**：订阅设备上报的 base64 图片报文，落盘为 `dataset/<成熟度>/imgN.jpg`（见第 6 节）。
+在此之上还提供**数据集采集**：订阅设备上报的 base64 图片报文，落盘为 `dataset/<成熟度>/imgN.jpg`；以及**数据集划分**：按类别随机打乱后复制为 `dataset_split/train` 与 `dataset_split/valid`（见第 6 节）。
 
 
 ---
@@ -19,13 +19,15 @@
 intelligent-conveyor-sorting/
 ├── conveyor/                    # 核心库（可复用）
 │   ├── __init__.py              # 导出 Mqtt_Clt 与 config
-│   ├── config.py                # 平台接入参数 + 指令常量 + 数据集目录 + create_client()
+│   ├── config.py                # 平台接入参数 + 指令常量 + 数据集/划分配置 + create_client()
 │   ├── dataset.py               # GetData：收 base64 图片并落盘为数据集
+│   ├── dataset_split.py         # SplitDataset：按类别随机划分 train / valid
 │   └── mqtt_client.py           # Mqtt_Clt：连接/订阅/发布/收报的封装
 ├── scripts/                     # 可执行入口
 │   ├── control_conveyor.py      # 传送带停止（最简示例）
 │   ├── control_rod_control.py   # 传送带运行 + 推杆往复循环
 │   ├── get_dataset.py           # 数据集采集（Ctrl+C 退出）
+│   ├── split_dataset.py         # 数据集划分（只复制不移动）
 │   ├── recv_msg.py              # 收设备上报 + 下发一串动作
 │   ├── pub_mqtt.py              # 原生 paho 发布示例
 │   └── sub_mqtt.py              # 原生 paho 订阅示例
@@ -33,6 +35,15 @@ intelligent-conveyor-sorting/
 │   ├── raw/                     # 未成熟
 │   ├── ripe/                    # 成熟
 │   └── half-ripe/               # 半成熟
+├── dataset_split/               # 划分输出（运行时生成，已被 .gitignore 忽略）
+│   ├── train/                   # 训练集（80%）
+│   │   ├── raw/
+│   │   ├── ripe/
+│   │   └── half-ripe/
+│   └── valid/                   # 验证集（剩余 20%）
+│       ├── raw/
+│       ├── ripe/
+│       └── half-ripe/
 ├── tests/                       # pytest 单元测试（全部离线，不需要 broker）
 │   ├── conftest.py              # FakePahoClient 与公共 fixture
 │   ├── test_config.py
@@ -40,7 +51,9 @@ intelligent-conveyor-sorting/
 │   ├── test_control_conveyor.py
 │   ├── test_control_rod_control.py
 │   ├── test_dataset.py
+│   ├── test_dataset_split.py
 │   ├── test_get_dataset.py
+│   ├── test_split_dataset.py
 │   ├── test_recv_msg.py
 │   ├── test_pub_mqtt.py
 │   └── test_sub_mqtt.py
@@ -101,6 +114,9 @@ python .\scripts\sub_mqtt.py
 
 # 5) 数据集采集：收设备上报的 base64 图片，存到 dataset/raw（Ctrl+C 退出）
 python .\scripts\get_dataset.py
+
+# 6) 数据集划分：按类别随机打乱，8:2 复制到 dataset_split/train 与 dataset_split/valid
+python .\scripts\split_dataset.py
 ```
 
 也可以按模块方式运行（等价）：
@@ -186,6 +202,10 @@ ROD_FIRST_PUSH, ROD_FIRST_PULL = "first_push", "first_pull"
 | `BROKER` / `PORT_WSS` / `PORT_TCP` / `WS_PATH` | 平台地址与端口、WebSocket 路径 |
 | `KEEPALIVE_SECS` / `CONNECT_TIMEOUT_SECS` / `PUBLISH_TIMEOUT_SECS` | 心跳、连接确认、发布确认超时 |
 | `TOPIC_SUB` / `TOPIC_PUB` | `lzm1` / `lzm0` |
+| `DATASET_ROOT` / `DATASET_RAW` / `DATASET_RIPE` / `DATASET_HALF_RIPE` | 数据集根目录与三类成熟度目录 |
+| `DATASET_CATEGORIES` | 参与划分的类别目录名（`half-ripe` / `raw` / `ripe`） |
+| `DATASET_SPLIT_ROOT` / `DATASET_SPLIT_TRAIN` / `DATASET_SPLIT_VALID` | 划分结果目录（`dataset_split/train`、`dataset_split/valid`） |
+| `PROP_TRAIN` / `SPLIT_SEED` | 训练集占比（`0.8`）与随机种子（`42`） |
 | `create_client(...)` | 按平台默认参数创建 `Mqtt_Clt`；`use_websocket=False` 时自动走 1883 明文并关闭 TLS |
 
 ```python
@@ -242,9 +262,10 @@ finally:
 
 ---
 
-## 6. 数据集采集
+## 6. 数据集采集与划分
 
-`scripts/get_dataset.py` 把设备上报的 base64 图片落盘成数据集，供后续训练/评估使用。
+`scripts/get_dataset.py` 把设备上报的 base64 图片落盘成数据集，供后续训练/评估使用；
+`scripts/split_dataset.py` 再把 `dataset/` 按类别随机划分为 `train` 与 `valid`。
 
 ### 6.1 报文与保存规则
 
@@ -333,7 +354,71 @@ finally:
 | `img{i}.jpg` 从 0 开始 | 扫描已有文件续号 | 重复采集不覆盖历史数据 |
 | 无异常处理 | 解码 / 编码 / 写入分别捕获并跳过 | 一条坏报文不会终止整个采集线程 |
 
-> `numpy`、`opencv-python` 只在采集时需要；采集产物位于 `dataset/`，已被 `.gitignore` 忽略，不会误提交。
+> `numpy`、`opencv-python` 只在采集时需要；采集产物位于 `dataset/`、划分产物位于 `dataset_split/`，均已被 `.gitignore` 忽略，不会误提交。
+
+### 6.6 数据集划分
+
+`scripts/split_dataset.py` 读取 `dataset/<类别>`，对**每个类别单独随机打乱**后，按 `PROP_TRAIN`（默认 0.8）切分并复制到 `dataset_split/train/<类别>` 与 `dataset_split/valid/<类别>`。
+
+规则：
+
+- **只复制不移动**：`shutil.copy` 复制文件，`dataset/` 源文件保持不变；
+- **每类单独切分**：三个类别都按比例划分，不会出现某一类全进训练集；
+- 训练集张数 = `int(类别总数 × PROP_TRAIN)`，验证集自动取剩余 20%；
+- **默认先清空 `dataset_split/`**：避免上次划分的旧文件残留，导致同一张图同时出现在 train 与 valid（数据泄漏）；需要保留时加 `--keep`；
+- 源目录 / 类别目录缺失、类别目录为空、占比不在 0~1 之间、目标目录与源目录重叠时**直接报错**，不会留下划分了一半的结果；
+- 固定 `SPLIT_SEED = 42` 时，同一份数据重复划分结果一致；`--seed -1` 则每次随机。
+
+当前 753 张数据的划分结果：
+
+```text
+half-ripe: train 200 张, valid 51 张
+raw: train 200 张, valid 51 张
+ripe: train 200 张, valid 51 张
+数据集划分完成, 输出目录: D:\...\dataset_split
+```
+
+### 6.7 命令行参数与运行
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--source` | `dataset` | 源数据集根目录（其下按类别分文件夹） |
+| `--target` | `dataset_split` | 划分结果根目录 |
+| `--prop-train` | `0.8` | 训练集占比（0~1），验证集自动取剩余部分 |
+| `--seed` | `42` | 随机种子；`-1` 表示每次随机 |
+| `--keep` | 关闭 | 保留目标目录已有文件（默认先清空） |
+
+```powershell
+# 默认：dataset -> dataset_split，8:2，种子 42（结果可复现）
+python .\scripts\split_dataset.py
+
+# 自定义占比与输出目录，每次随机打乱
+python .\scripts\split_dataset.py --prop-train 0.7 --target .\dataset_70 --seed -1
+
+# 保留目标目录已有文件（不清空）
+python .\scripts\split_dataset.py --keep
+```
+
+常改的参数也可以直接改 `conveyor/config.py` 里的 `PROP_TRAIN` / `DATASET_SPLIT_ROOT` / `SPLIT_SEED` / `DATASET_CATEGORIES`。
+
+### 6.8 API：`conveyor.dataset_split.SplitDataset`
+
+| 成员 | 说明 |
+| --- | --- |
+| `SplitDataset(source_dir, target_dir, categories=None, prop_train=0.8, seed=42, clean=True)` | 记录划分参数；`categories` 默认取 `config.DATASET_CATEGORIES` |
+| `run()` | 校验 → 清空/创建目标目录 → 逐类划分，返回 `{"raw": {"train": 200, "valid": 51}, ...}` |
+| `split_category(category)` | 单类别打乱 + 切分 + 复制，返回该类别数量 |
+| `list_images(folder_path)` | 列出目录内文件名（忽略子目录），排序后再打乱以保证可复现 |
+| `copy_images(images, src_dir, dst_dir)` | 逐个 `shutil.copy`，同名覆盖，源文件不变 |
+| `summary` | 最近一次 `run()` 的各类别 train / valid 数量 |
+
+```python
+from conveyor import config
+from conveyor.dataset_split import SplitDataset
+
+splitter = SplitDataset(prop_train=config.PROP_TRAIN, seed=config.SPLIT_SEED)
+summary = splitter.run()
+```
 
 ## 7. 测试
 
@@ -362,9 +447,11 @@ python -m pytest -v
 | `test_pub_mqtt.py` | 原生客户端 wss 配置、连接回调输出、发布参数与等待确认、断开顺序 |
 | `test_sub_mqtt.py` | 订阅 `lzm1`、连接失败不订阅、消息打印、`loop_forever` 中断后断开 |
 | `test_dataset.py` | 目录创建/复用、序号续接、base64 解码落盘、非图像报文跳过、坏数据/编码/写入失败、线程收发与关闭、真实 opencv 往返 |
+| `test_dataset_split.py` | 配置默认值、按类别 8:2 切分与源文件不变、打乱/种子复现、清空与 `--keep`、缺类/空类/非法占比/目录重叠校验 |
 | `test_get_dataset.py` | 默认参数、命令行覆盖（本地 broker/tcp）、`create_client` 装配、Ctrl+C 与异常时关闭采集器 |
+| `test_split_dataset.py` | 默认与自定义命令行参数、`SplitDataset` 装配、`--seed -1` 与 `--keep` 映射 |
 
-当前结果：**62 passed**。
+当前结果：**82 passed**。
 
 > 测试替身只模拟行为、不校验真实 broker 语义；真实链路仍需用 `control_conveyor.py` + MQTTX 联合验证。
 
@@ -406,6 +493,8 @@ python -m pytest -v
 | 采集脚本一直收不到图片 | 设备未上报，或报文里没有 `image` 键 | 先用 `python .\scripts\sub_mqtt.py` 看 `lzm1` 原始报文，确认键名与 base64 内容 |
 | 提示"图片解码失败, 已跳过该报文" | base64 解出来不是图片（如 URL、纯文本、二次编码） | 让设备端先 JPEG/PNG 编码再 base64，只编码一次 |
 | 采集图片不全 / 频繁"消息队列满" | 图片体积大、落盘慢，`queue.Queue(5)` 溢出 | 降低设备推送频率，或调大 `Mqtt_Clt` 的队列容量（会占更多内存） |
+| 报错"源数据集缺少类别目录" | `dataset/` 下三类目录不全 | 补齐 `dataset/raw`、`dataset/ripe`、`dataset/half-ripe` 后再划分 |
+| train / valid 中出现同名图片 | 上一次划分的旧文件残留，或用了 `--keep` 追加不同批次 | 默认会清空 `dataset_split/`；跨批次划分时不要用 `--keep` |
 
 自检顺序（推荐）：
 
@@ -455,6 +544,7 @@ from conveyor import config
 - **队列解耦**：`on_message` 只做解析入队，业务线程通过 `mqtt_queue` 消费，避免阻塞 paho 网络线程。
 - **唯一 client_id**：避免同 ID 客户端互踢，导致"时而收得到、时而收不到"。
 - **采集线程**：`GetData` 用 daemon 线程 + `stop_event` 消费 `mqtt_queue`，`close()` 先停线程再断 MQTT，避免写出半张图片。
+- **可复现划分**：`SplitDataset` 用独立的 `random.Random(seed)` 打乱，固定种子即可复现同一份 train / valid；默认先清空输出目录，避免旧文件残留造成训练/验证数据泄漏。
 - **中文路径**：图片落盘用 `cv2.imencode()` + `Path.write_bytes()`；`cv2.imwrite()` / `cv2.imread()` 在 Windows 中文路径下会静默失败。
 
 已知限制：

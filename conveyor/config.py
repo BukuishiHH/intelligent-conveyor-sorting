@@ -37,6 +37,15 @@ DATASET_RAW = DATASET_ROOT / "raw"              # 未成熟果实
 DATASET_RIPE = DATASET_ROOT / "ripe"            # 成熟果实
 DATASET_HALF_RIPE = DATASET_ROOT / "half-ripe"  # 半成熟果实
 
+# ---------------- 数据集划分 ----------------
+# 划分时按类别单独打乱, 每个类别取 prop_train 作为训练集, 剩余为验证集
+DATASET_CATEGORIES = (DATASET_HALF_RIPE.name, DATASET_RAW.name, DATASET_RIPE.name)  # 参与划分的类别目录
+DATASET_SPLIT_ROOT = PROJECT_ROOT / "dataset_split"        # 划分结果根目录
+DATASET_SPLIT_TRAIN = DATASET_SPLIT_ROOT / "train"         # 训练集目录
+DATASET_SPLIT_VALID = DATASET_SPLIT_ROOT / "valid"         # 验证集目录
+PROP_TRAIN = 0.8                                           # 训练集占比, 验证集自动取剩余部分
+SPLIT_SEED = 42                                            # 随机种子, 相同数据下结果可复现; None 表示每次随机
+
 # ---------------- 图像报文 ----------------
 KEY_IMAGE = "image"             # 图像报文的键, 值为 base64 编码的图片
 IMAGE_SUFFIX = ".jpg"           # 图片保存后缀

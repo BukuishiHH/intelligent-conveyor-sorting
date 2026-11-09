@@ -7,3 +7,4 @@ venv/
 .vscode/
 *.log
 dataset/
+dataset_split/
