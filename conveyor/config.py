@@ -64,6 +64,21 @@ SEED = 0                                        # 全局随机种子
 PREDICT_MODEL = MODEL_DIR / "best.pth"              # 单图推理默认加载的权重
 PREDICT_RESULT = MODEL_DIR / "predict_result.png"   # 单图推理可视化的默认输出
 
+# ---------------- 自动分拣 ----------------
+# 推杆序号与光电对管序号与设备约定一致, 修改硬件接线时只需改这里
+ROD_LOAD = "first"                  # 上料推杆
+ROD_RIPE = "second"                 # 成熟果分拣推杆
+ROD_HALF_RIPE = "third"             # 半成熟果分拣推杆
+ROD_RAW = "fourth"                  # 未成熟果分拣推杆
+ROD_ALL_PULL = "all_pull"           # 所有推杆拉回
+SWITCH_RIPE = "first_switch"        # 成熟果光电对管
+SWITCH_HALF_RIPE = "second_switch"  # 半成熟果光电对管
+SWITCH_RAW = "third_switch"         # 未成熟果光电对管
+SWITCH_ACTIVE_VALUE = False         # 对管触发时的上报值(示例设备低电平有效, 遮挡时上报 False)
+ROD_PUSH_SECS = 1.0                 # 推杆推出后保持时间(秒)
+ROD_RELOAD_DELAY_SECS = 0.2         # 分拣推杆动作后补料推杆的延时(秒)
+ROD_START_DELAY_SECS = 0.5          # 启动后首次推出上料推杆的延时(秒)
+
 # ---------------- 图像报文 ----------------
 KEY_IMAGE = "image"             # 图像报文的键, 值为 base64 编码的图片
 IMAGE_SUFFIX = ".jpg"           # 图片保存后缀

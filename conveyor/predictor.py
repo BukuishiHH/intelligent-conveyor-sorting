@@ -1,5 +1,10 @@
 """
-单图推理: 加载训练好的 ResNet 权重, 判断单张桃子的成熟度
+单图推理: 加载训练好的 ResNet 权重, 判断单个桃子图像的成熟度
+
+支持三种输入:
+    - 本地图片路径: predict(image_path)
+    - 已解码的 RGB ndarray: predict_image(image)
+    - MQTT 报文里的 base64 字符串: predict_base64(image_base64)
 
 流程与原始示例一致:
     1. 加载 best.pth(结构与分类数可配置, 缺失时直接报错而不是随机初始化);
@@ -12,6 +17,7 @@
 项目默认取 config.DATASET_CATEGORIES, 即 half-ripe / raw / ripe。
 """
 
+import base64
 from pathlib import Path
 
 import cv2
@@ -90,16 +96,27 @@ class ResNetPredictor():
         """
         读取图片并转换为 RGB ndarray
 
-        用 np.fromfile + cv2.imdecode 而不是 cv2.imread:
+        用 Path.read_bytes + cv2.imdecode 而不是 cv2.imread:
         cv2.imread 在 Windows 中文路径下会静默返回 None。
         """
         image_path = Path(image_path)
         if not image_path.is_file():
             raise FileNotFoundError(f"图片不存在: {image_path}")
-        data = np.fromfile(str(image_path), dtype=np.uint8)
-        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        return self.decode_image(image_path.read_bytes(), source=image_path)
+
+    def decode_image(self, image_data, source="<bytes>"):
+        """
+        图片字节 -> RGB ndarray
+
+        parameters:image_data:图片二进制数据(如 base64.b64decode 的结果)
+                source:解码失败时用于提示的来源, 可以是路径或描述
+
+        returns:RGB 顺序的 ndarray
+        """
+        image_array = np.frombuffer(image_data, np.uint8)
+        image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
         if image is None:
-            raise ValueError(f"图片解码失败: {image_path}")
+            raise ValueError(f"图片解码失败: {source}")
         return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
     def preprocess(self, image):
@@ -134,15 +151,40 @@ class ResNetPredictor():
                 input_shape:送入网络的张量形状, 如 (1, 3, 224, 224)
                 timings:各阶段耗时(毫秒), 含 load / preprocess / warmup / inference
         """
-        timings = {"load": 0.0, "preprocess": 0.0, "warmup": 0.0, "inference": 0.0}
-        if self.model is None:
-            self.load_model()
-            timings["load"] = self.load_time
-
         with Profile() as preprocess:
             image = self.read_image(image_path)
             input_batch = self.preprocess(image)
-        timings["preprocess"] = preprocess.t * 1E3
+        return self._predict(image, input_batch, preprocess.t * 1E3)
+
+    def predict_image(self, image):
+        """
+        对已解码的 RGB 图片推理, 不需要落盘
+
+        parameters:image:RGB 顺序的 ndarray(如 decode_image 的返回值)
+
+        returns:与 predict 相同的结果字典
+        """
+        with Profile() as preprocess:
+            input_batch = self.preprocess(image)
+        return self._predict(image, input_batch, preprocess.t * 1E3)
+
+    def predict_base64(self, image_base64):
+        """
+        对 MQTT 报文里的 base64 图片推理, 不需要落盘
+
+        parameters:image_base64:base64 编码的图片字符串
+
+        returns:与 predict 相同的结果字典
+        """
+        image = self.decode_image(base64.b64decode(image_base64), source="<base64>")
+        return self.predict_image(image)
+
+    def _predict(self, image, input_batch, preprocess_ms):
+        """ 加载模型(如需) / 预热(首次) / 前向, 汇总识别结果与各阶段耗时 """
+        timings = {"load": 0.0, "preprocess": preprocess_ms, "warmup": 0.0, "inference": 0.0}
+        if self.model is None:
+            self.load_model()
+            timings["load"] = self.load_time
 
         if not self.warmed_up:                  # 只预热一次, 后续推理不再重复
             with Profile() as warmup:

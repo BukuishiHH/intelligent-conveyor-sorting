@@ -1,5 +1,8 @@
 """ conveyor.predictor 的单元测试(CPU + 合成小图, 不依赖真实数据集与训练) """
 
+import base64
+import io
+
 import matplotlib
 
 matplotlib.use("Agg")               # 无界面环境下保存可视化图片
@@ -107,6 +110,61 @@ def test_read_image_missing_file(tiny_model, tmp_path):
 
     with pytest.raises(FileNotFoundError, match="图片不存在"):
         predictor.read_image(tmp_path / "not-exist.jpg")
+
+
+def test_decode_image_returns_rgb(tiny_model, tmp_path):
+    """ 图片字节解码后必须是 RGB, 供 ToPILImage 使用 """
+    buffer = io.BytesIO()
+    Image.new("RGB", (30, 20), color=(0, 0, 255)).save(buffer, format="PNG")
+    predictor = make_predictor(tiny_model, tmp_path)
+
+    image = predictor.decode_image(buffer.getvalue())
+
+    assert image.shape == (20, 30, 3)
+    assert image[0, 0].tolist() == [0, 0, 255]
+
+
+def test_decode_image_rejects_invalid_bytes(tiny_model, tmp_path):
+    predictor = make_predictor(tiny_model, tmp_path)
+
+    with pytest.raises(ValueError, match="图片解码失败"):
+        predictor.decode_image(b"not-an-image", source="mqtt")
+
+
+def test_predict_image_accepts_rgb_array(tiny_model, tmp_path):
+    """ 已解码的图片可直接推理, 不需要落盘 """
+    image = np.zeros((80, 60, 3), dtype=np.uint8)
+    image[:, :, 1] = 200
+    predictor = make_predictor(tiny_model, tmp_path)
+
+    result = predictor.predict_image(image)
+
+    assert result["class_name"] in config.DATASET_CATEGORIES
+    assert result["image"] is image
+    assert result["input_shape"] == (1, 3, 32, 32)
+    assert result["timings"]["load"] > 0.0
+    assert set(result["timings"]) == {"load", "preprocess", "warmup", "inference"}
+    assert result["timings"]["preprocess"] >= 0.0    # time.time() 分辨率下可能不足一个刻度
+    assert result["timings"]["warmup"] > 0.0
+
+
+def test_predict_base64_decodes_and_infers(tiny_model, tiny_image, tmp_path):
+    """ MQTT 报文里的 base64 图片可以直接推理 """
+    image_base64 = base64.b64encode(tiny_image.read_bytes()).decode("ascii")
+    predictor = make_predictor(tiny_model, tmp_path)
+
+    result = predictor.predict_base64(image_base64)
+
+    assert result["class_name"] in config.DATASET_CATEGORIES
+    assert result["image"].shape == (80, 80, 3)
+    assert sum(result["probabilities"]) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_predict_base64_rejects_invalid_base64(tiny_model, tmp_path):
+    predictor = make_predictor(tiny_model, tmp_path)
+
+    with pytest.raises(ValueError):
+        predictor.predict_base64("%%%not-base64%%%")
 
 
 def test_preprocess_shape_and_device(tiny_model, tmp_path):

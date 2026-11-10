@@ -8,7 +8,7 @@
 2. **在 `on_connect` 里订阅** —— 断线重连后自动重新订阅，不会静默失聪；
 3. **发布后等投递确认** —— QoS1 + `wait_for_publish()`，避免 `publish()` 之后立即退出导致报文从未发出。
 
-在此之上还提供**数据集采集**：订阅设备上报的 base64 图片报文，落盘为 `dataset/<成熟度>/imgN.jpg`；**数据集划分**：按类别随机打乱后复制为 `dataset_split/train` 与 `dataset_split/valid`；**模型训练**：用 ResNet-18/34/50 完成训练、验证与保存；以及**单图推理**：加载训练好的权重，输出成熟度类别、概率与各阶段耗时（见第 6、7、8 节）。
+在此之上还提供**数据集采集**：订阅设备上报的 base64 图片报文，落盘为 `dataset/<成熟度>/imgN.jpg`；**数据集划分**：按类别随机打乱后复制为 `dataset_split/train` 与 `dataset_split/valid`；**模型训练**：用 ResNet-18/34/50 完成训练、验证与保存；**单图推理**：加载训练好的权重，输出成熟度类别、概率与各阶段耗时；**自动分拣**：把 MQTT 图像报文、ResNet 推理与光电对管 / 推杆控制串成闭环（见第 6、7、8、9 节）。
 
 
 ---
@@ -24,7 +24,8 @@ intelligent-conveyor-sorting/
 │   ├── dataset_split.py         # SplitDataset：按类别随机划分 train / valid
 │   ├── resnet.py                # ResNet-18/34/50 网络定义与预训练权重加载
 │   ├── trainer.py               # ResNetTrainer：训练 / 验证 / 保存 / 混淆矩阵
-│   ├── predictor.py             # ResNetPredictor：单图推理 / 预处理 / 预热 / 可视化
+│   ├── predictor.py             # ResNetPredictor：单图/内存/base64 推理、预处理、预热、可视化
+│   ├── sorter.py                # ConveyorSorter：识别结果 + 光电对管 -> 推杆分拣
 │   ├── profile.py               # Profile：代码段耗时测量（CUDA 计时前同步）
 │   └── mqtt_client.py           # Mqtt_Clt：连接/订阅/发布/收报的封装
 ├── scripts/                     # 可执行入口
@@ -34,6 +35,7 @@ intelligent-conveyor-sorting/
 │   ├── split_dataset.py         # 数据集划分（只复制不移动）
 │   ├── train_resnet.py          # ResNet 训练 / 验证 / 保存模型
 │   ├── predict_resnet.py        # 单图推理（类别 / 概率 / 各阶段耗时）
+│   ├── sort_conveyor.py         # 自动分拣主程序（识别 + 对管 + 推杆）
 │   ├── recv_msg.py              # 收设备上报 + 下发一串动作
 │   ├── pub_mqtt.py              # 原生 paho 发布示例
 │   └── sub_mqtt.py              # 原生 paho 订阅示例
@@ -73,6 +75,8 @@ intelligent-conveyor-sorting/
 │   ├── test_split_dataset.py
 │   ├── test_train_resnet.py
 │   ├── test_predict_resnet.py
+│   ├── test_sorter.py
+│   ├── test_sort_main.py
 │   ├── test_recv_msg.py
 │   ├── test_pub_mqtt.py
 │   └── test_sub_mqtt.py
@@ -86,7 +90,7 @@ intelligent-conveyor-sorting/
 
 | 层 | 目录 | 职责 |
 | --- | --- | --- |
-| 核心库 | `conveyor/` | MQTT 通信、参数定义、数据集处理、ResNet 训练与单图推理封装，不写业务循环 |
+| 核心库 | `conveyor/` | MQTT 通信、参数定义、数据集处理、ResNet 训练/推理、分拣控制封装，业务循环只出现在类内，入口脚本只做装配 |
 | 入口脚本 | `scripts/` | 组装业务动作，包含 `main()` 与 `if __name__ == '__main__'` |
 | 测试 | `tests/` | 每个模块一个测试文件，用替身替代真实网络；训练/推理测试用小图 + CPU |
 | 运行时产物 | `dataset/`、`dataset_split/`、`pre_model/`、`model/` | 采集数据、划分结果、预训练权重、训练与推理输出，均不提交仓库 |
@@ -150,6 +154,9 @@ python .\scripts\train_resnet.py
 
 # 8) 单图推理：加载 model/best.pth，输出类别 / 概率 / 各阶段耗时（图片路径换成实际文件）
 python .\scripts\predict_resnet.py --image .\dataset_split\valid\ripe\img1.jpg
+
+# 9) 自动分拣：识别 MQTT 图像并按光电对管推出对应推杆（Ctrl+C 退出）
+python .\scripts\sort_conveyor.py
 ```
 
 也可以按模块方式运行（等价）：
@@ -244,6 +251,9 @@ ROD_FIRST_PUSH, ROD_FIRST_PULL = "first_push", "first_pull"
 | `EPOCHS` / `BATCH_SIZE` / `VALID_BATCH_SIZE` | 训练轮数（10）、训练批大小（16）、验证批大小（4） |
 | `LEARNING_RATE` / `IMAGE_SIZE` / `NUM_WORKERS` / `SEED` | Adam 学习率（`1e-4`）、输入边长（224）、DataLoader 进程数（0）、随机种子（0） |
 | `PREDICT_MODEL` / `PREDICT_RESULT` | 单图推理默认权重（`model/best.pth`）与可视化输出（`model/predict_result.png`） |
+| `ROD_LOAD` / `ROD_RIPE` / `ROD_HALF_RIPE` / `ROD_RAW` | 自动分拣推杆序号：上料（`first`）、成熟（`second`）、半熟（`third`）、未熟（`fourth`） |
+| `SWITCH_RIPE` / `SWITCH_HALF_RIPE` / `SWITCH_RAW` | 三类对应的光电对管键名（`first_switch` / `second_switch` / `third_switch`） |
+| `SWITCH_ACTIVE_VALUE` / `ROD_PUSH_SECS` / `ROD_RELOAD_DELAY_SECS` / `ROD_START_DELAY_SECS` | 对管触发值（`False`）、推杆保持 1 s、补料延时 0.2 s、启动上料延时 0.5 s |
 | `create_client(...)` | 按平台默认参数创建 `Mqtt_Clt`；`use_websocket=False` 时自动走 1883 明文并关闭 TLS |
 
 ```python
@@ -599,7 +609,7 @@ print(result["accuracy"], result["best_model"])
 | 步骤 | 实现 | 说明 |
 | --- | --- | --- |
 | 1. 加载模型 | `create_resnet(arch, num_classes)` + `load_state_dict` + `eval()` | 权重缺失直接抛 `FileNotFoundError`，不会用随机初始化“假装”推理 |
-| 2. 预处理 | `np.fromfile` + `cv2.imdecode` → BGR 转 RGB → `ToPILImage` + `Resize(image_size)` + `ToTensor` + ImageNet 归一化 → `unsqueeze(0)` | 用 `imdecode` 而非 `imread`，兼容 Windows 中文路径 |
+| 2. 预处理 | `Path.read_bytes` + `cv2.imdecode` → BGR 转 RGB → `ToPILImage` + `Resize(image_size)` + `ToTensor` + ImageNet 归一化 → `unsqueeze(0)` | 用 `imdecode` 而非 `imread`，兼容 Windows 中文路径；MQTT 报文走 `predict_base64()`，无需落盘 |
 | 3. 预热 | 全零 `(1, 3, image_size, image_size)` 输入跑一次 | 把首次推理的内存分配 / 算子加载开销排除在计时之外，只做一次 |
 | 4. 推理 | `eval()` + `torch.no_grad()`，softmax 后 `torch.max` | 不建计算图，固定 BN 统计量 |
 | 5. 可视化 | matplotlib 显示原图，标题为 `Predicted class: xxx, probability: xxx` | 默认保存 `model/predict_result.png`，`--no-show` 不弹窗 |
@@ -652,7 +662,10 @@ python .\scripts\predict_resnet.py --image test.jpg --model .\model\resnet34.pth
 | --- | --- |
 | `ResNetPredictor(model_path, arch, num_classes, image_size, class_names=None, device=None, result_path=..., verbose=True)` | 记录推理参数；`class_names` 默认取 `config.DATASET_CATEGORIES`，个数必须等于 `num_classes` |
 | `load_model()` | 创建 ResNet、加载权重、`eval()` 并记录加载耗时，返回模型 |
-| `read_image(image_path)` | 读图并转 RGB（`np.fromfile` + `cv2.imdecode`，兼容中文路径） |
+| `read_image(image_path)` | 读图并转 RGB（`Path.read_bytes` + `cv2.imdecode`，兼容中文路径） |
+| `decode_image(image_data, source="<bytes>")` | 图片字节 → RGB ndarray（base64 解码后的数据可直接传入） |
+| `predict_image(image)` | 对已解码的 RGB ndarray 推理，不落盘 |
+| `predict_base64(image_base64)` | 对 MQTT 报文里的 base64 图片推理，不落盘 |
 | `preprocess(image)` | `ToPILImage + Resize + ToTensor + Normalize`，补批次并移到设备 |
 | `warmup()` | 全零输入预热一次 |
 | `predict(image_path)` | 返回 `class_index` / `class_name` / `probability` / `probabilities` / `image` / `input_shape` / `timings` |
@@ -673,7 +686,7 @@ predictor.save_visualization(result["image"], result, show=True)
 | --- | --- | --- |
 | 固定 `resnet18()` 再手工替换 `fc` | `create_resnet(arch, num_classes)` 直接按分类数构建 | 与训练侧结构一致，同时支持 34 / 50 |
 | `torch.load(...)` 不指定 `map_location` | `load_state_dict(path, map_location=device)` | GPU 推理不必先落到 CPU 再搬运 |
-| `cv2.imread` 读图 | `np.fromfile` + `cv2.imdecode` | Windows 中文路径下 `imread` 会静默返回 `None` |
+| `cv2.imread` 读图 | `Path.read_bytes` + `cv2.imdecode` | Windows 中文路径下 `imread` 会静默返回 `None` |
 | 内联 `Profile` 与 `plt.show()` | `conveyor/profile.py` 复用 + `save_visualization(show=False)` | 可单测、无界面环境也能出图 |
 | `classes` 字典写死 | `class_names` 默认取 `config.DATASET_CATEGORIES` | 类别与训练目录一处维护 |
 | 每次预测都预热 | `warmed_up` 标记，只预热一次 | 循环推理不重复付预热开销 |
@@ -681,7 +694,128 @@ predictor.save_visualization(result["image"], result, show=True)
 
 ---
 
-## 9. 测试
+## 9. 自动分拣主程序
+
+`conveyor/sorter.py` 封装 `ConveyorSorter`，`scripts/sort_conveyor.py` 是主程序入口。它把前面几节串成闭环：**加载权重 → 连接平台 → 收图像报文并识别 → 按光电对管触发推杆 → 延时补料**。
+
+### 9.1 控制流程
+
+| 步骤 | 触发 | 动作 |
+| --- | --- | --- |
+| 1. 启动 | `sorter.run()` → `start()` | 下发 `{"conveyor": "run"}`、`{"rod_control": "all_pull"}`，0.5 s 后推出上料推杆 `first` |
+| 2. 识别 | 报文含 `image` | `predict_base64()` 解码 + 推理，记录当前类别（`ripe` / `half-ripe` / `raw`） |
+| 3. 分拣 | 对管键匹配当前类别 | 立即推出对应分拣推杆，0.2 s 后推出 `first` 补料 |
+| 4. 复位 | 推杆推出 1 s 后 | 自动下发 `<rod>_pull` |
+| 5. 退出 | Ctrl+C / 异常 | 取消未执行定时器，等待执行中的推杆拉回，停传送带，关 MQTT |
+
+推杆与对管映射（均可在 `conveyor/config.py` 修改）：
+
+| 类别 | 分拣推杆 | 光电对管 | 默认触发值 |
+| --- | --- | --- | --- |
+| `ripe` | `second` | `first_switch` | `False` |
+| `half-ripe` | `third` | `second_switch` | `False` |
+| `raw` | `fourth` | `third_switch` | `False` |
+| 上料 | `first` | — | — |
+
+> 示例设备在遮挡时上报 `{"first_switch": false}`（低电平有效），因此默认 `switch_active_value=False`。若实际设备为高电平有效，用 `--switch-value true` 或构造参数 `switch_active_value=True`。
+
+识别和动作都在主循环 / 定时器线程中执行：坏图片只跳过当前报文，单个推杆指令失败也不会中断分拣；推杆推出后在新线程里等待 1 s 再拉回，不阻塞后续图像识别。
+
+### 9.2 命令行参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--host` / `--port` | 平台 / 按传输方式 | broker 地址与端口；本地调试可传 `127.0.0.1` / `21883` |
+| `--sub` / `--pub` | `lzm1` / `lzm0` | 订阅设备上报、发布控制指令 |
+| `--transport` | `wss` | `wss`（平台 9002）或 `tcp`（明文 1883 / 本地 broker） |
+| `--model` | `model/best.pth` | 模型权重；缺失时启动即报错，不会连接平台 |
+| `--arch` | `resnet18` | `resnet18` / `resnet34` / `resnet50`，需与训练时一致 |
+| `--image-size` | `224` | 输入边长，需与训练时一致 |
+| `--classes` | `half-ripe raw ripe` | 类别顺序，需与训练时 `ImageFolder` 一致 |
+| `--device` | `auto` | `auto` / `cpu` / `cuda` |
+| `--switch-value` | `false` | 对管触发时的上报值，`false` / `true` |
+
+### 9.3 运行与输出
+
+```powershell
+# 平台默认 wss 9002 + model/best.pth
+python .\scripts\sort_conveyor.py
+
+# 本地 broker + 明文端口（示例代码里的 127.0.0.1:21883，主题 bb -> aa）
+python .\scripts\sort_conveyor.py --transport tcp --host 127.0.0.1 --port 21883 `
+    --sub bb --pub aa
+
+# 换权重、CPU 推理、对管高电平有效
+python .\scripts\sort_conveyor.py --model .\model\last.pth --device cpu --switch-value true
+```
+
+输出示例：
+
+```text
+已加载模型: D:\...\model\best.pth, 设备: cpu
+MQTT连接成功, 已订阅主题 lzm1
+下发指令: conveyor=run -> 主题 lzm0
+下发指令: rod_control=all_pull -> 主题 lzm0
+开始分拣, 按 Ctrl+C 退出
+识别结果: ripe, 概率: 0.9999, 推理耗时: 8.3ms
+对管 first_switch 触发, 类别 ripe -> 推杆 second
+下发指令: rod_control=second_push -> 主题 lzm0
+下发指令: rod_control=first_push -> 主题 lzm0
+下发指令: rod_control=second_pull -> 主题 lzm0
+下发指令: rod_control=first_pull -> 主题 lzm0
+程序退出, 关闭mqtt
+下发指令: conveyor=stop -> 主题 lzm0
+```
+
+> 同一时间只跟踪**最近一帧图像的类别**（与示例代码一致）。设备需要保证“先上报图像、后上报对管”的顺序；图像与对管不是一一对应时，可能用旧类别触发推杆。
+
+### 9.4 API：`conveyor.sorter.ConveyorSorter`
+
+| 成员 | 说明 |
+| --- | --- |
+| `ConveyorSorter(mqtt_client, predictor=None, load_rod="first", class_rods=None, switch_classes=None, push_secs=1.0, reload_delay=0.2, start_delay=0.5, switch_active_value=False, verbose=True)` | 记录设备映射与动作延时；`predictor` 不传时自动创建 `ResNetPredictor` |
+| `start()` | 传送带运行 + 所有推杆拉回 + 延时推出上料推杆 |
+| `run(poll_secs=0.5)` | 启动设备并循环消费 `mqtt_client.mqtt_queue`，直到 `close()` / Ctrl+C |
+| `handle_message(msg)` | 图像报文转 `identify()`，其他报文转 `handle_switch()` |
+| `identify(image_base64)` | base64 解码 + 推理，成功时更新 `current_class`；失败返回 `None` 并保留上一次类别 |
+| `handle_switch(msg)` | 对管键与当前类别同时匹配时，调度分拣推杆和补料推杆 |
+| `push_pull(rod)` | 推出推杆 → 保持 `push_secs` → 拉回 |
+| `schedule(delay, rod)` | 用 daemon `threading.Timer` 延时执行 `push_pull`，返回定时器 |
+| `close()` | 取消未执行定时器、等待执行中的推杆复位、下发 `conveyor=stop`、关闭 MQTT |
+| `current_class` | 最近一次识别出的类别，未被识别前为 `None` |
+
+```python
+from conveyor import config
+from conveyor.predictor import ResNetPredictor
+from conveyor.sorter import ConveyorSorter
+
+mqtt_client = config.create_client()
+predictor = ResNetPredictor(device="cuda")
+predictor.load_model()
+sorter = ConveyorSorter(mqtt_client, predictor)
+try:
+    sorter.run()
+finally:
+    sorter.close()
+```
+
+### 9.5 与原始示例代码的差异
+
+| 原示例 | 本项目 | 原因 |
+| --- | --- | --- |
+| `hqyj_mqtt.Mqtt_Clt` + 写死 `127.0.0.1:21883` / `bb -> aa` | `config.create_client()` + `--host/--port/--sub/--pub/--transport` | 同一入口既能连平台 wss，也能连本地 broker |
+| 外部 `predict_resnet(image)`，模型状态散落 | 复用 `ResNetPredictor.predict_base64()`，模型只加载、预热一次 | 循环识别不重复付加载 / 预热开销 |
+| 脚本里手写 base64 / `np.frombuffer` / `cv2.imdecode` | `predictor.decode_image()` + `predict_base64()` | 解码与 BGR→RGB 只维护一份 |
+| `result`、推杆名、对管名都是模块级全局变量 | `current_class` 与 `config.ROD_*` / `config.SWITCH_*` | 参数集中管理，便于换硬件接线 |
+| `ripe_switch == msg` 比较整个字典 | 按对管键 + 配置的触发值匹配 | 报文同时带多个键时不会误判 |
+| `threading.Timer` 创建后不跟踪 | daemon 定时器集中登记，退出时 `cancel()` 并等待在途推杆拉回 | Ctrl+C 后不会残留推杆动作或停在推出状态 |
+| Ctrl+C 直接退出，不停传送带 | `close()` 下发 `conveyor=stop` 并关闭 MQTT | 避免设备继续运行 |
+| 首次收到图片才发现权重不存在 | 主程序先 `load_model()`，失败则不连接平台 | 避免设备被启动后才发现无法识别 |
+| 无命令行参数 | `--model/--arch/--image-size/--classes/--device/--switch-value` | 同一入口适配不同权重与设备电平 |
+
+---
+
+## 10. 测试
 
 测试只依赖 `pytest`，**全部离线运行**：`tests/conftest.py` 里的 `FakePahoClient` 替换了 `paho.mqtt.client.Client`，
 并让 `loop_start()` 立即回调 `on_connect`（模拟 broker 返回 CONNACK），因此不需要网络、不会向设备发指令。
@@ -712,13 +846,15 @@ python -m pytest -v
 | `test_resnet.py` | BasicBlock/Bottleneck 的 `expansion`、ResNet v1.5 步距、18/34/50 结构与前向输出、`create_resnet` 非法结构、权重文件映射、缺失权重回退、state_dict 存取往返 |
 | `test_trainer.py` | ImageFolder/DataLoader 装配、类别一致性校验、预训练权重路径、固定种子复现、CPU 小图完整训练并检查 best/last/混淆矩阵、评估准确率 |
 | `test_profile.py` | 单次/多次累加计时、初始耗时、作为装饰器使用 |
-| `test_predictor.py` | 默认参数、类别数与名称校验、权重缺失报错、`eval()` 与加载计时、BGR→RGB、Resize 后张量形状、推理结果/概率和/各阶段耗时、复用模型只预热一次、中文路径读图、可视化落盘 |
+| `test_predictor.py` | 默认参数、类别数与名称校验、权重缺失报错、`eval()` 与加载计时、BGR→RGB、`decode_image` 字节解码/非法数据、Resize 后张量形状、`predict` / `predict_image` / `predict_base64` 三种入口、概率和、复用模型只预热一次、中文路径读图、可视化落盘 |
 | `test_get_dataset.py` | 默认参数、命令行覆盖（本地 broker/tcp）、`create_client` 装配、Ctrl+C 与异常时关闭采集器 |
 | `test_split_dataset.py` | 默认与自定义命令行参数、`SplitDataset` 装配、`--seed -1` 与 `--keep` 映射 |
 | `test_train_resnet.py` | 默认/自定义命令行参数、`ResNetTrainer` 装配、`auto` 设备与 `--no-pretrained` 映射 |
 | `test_predict_resnet.py` | 默认/自定义命令行参数、`--image` 必填、耗时格式化、`ResNetPredictor` 装配、`auto` 设备与 `--no-show` 映射 |
+| `test_sorter.py` | 默认推杆/对管映射、类别缺少推杆校验、启动指令与上料定时、push→等待→pull 时序、识别成功/失败隔离、对管触发值（`False` / `True` 可配）、类别不匹配不动作、消息路由、主循环消费与关闭、close 取消定时器/停传送带/关 MQTT |
+| `test_sort_main.py` | 默认/自定义命令行参数、`create_client` / `ResNetPredictor` / `ConveyorSorter` 装配、`--switch-value` 映射、Ctrl+C 与异常关闭、权重缺失时不连接平台 |
 
-当前结果：**126 passed**。
+当前结果：**154 passed**。
 
 > 训练 / 推理相关测试使用 3 类合成小图和随机初始化的 ResNet-18 权重，在 CPU 上完成 1 个 epoch 训练或单图前向，**不需要 GPU、真实数据集或网络**。
 
@@ -726,7 +862,7 @@ python -m pytest -v
 
 ---
 
-## 10. MQTTX 客户端配置
+## 11. MQTTX 客户端配置
 
 想用图形客户端观察报文，必须配对协议，否则连不上 9002：
 
@@ -747,7 +883,7 @@ python -m pytest -v
 
 ---
 
-## 11. 故障排查
+## 12. 故障排查
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
@@ -775,6 +911,12 @@ python -m pytest -v
 | 推理类别与肉眼不符 | `--classes` 顺序与训练目录排序不一致，或 `--arch` / `--image-size` 与训练不符 | 保持默认 `half-ripe raw ripe`；`--arch`、`--image-size` 与训练命令一致 |
 | 加载推理权重报 `size mismatch` | `--classes` 个数与训练时分类数不一致 | `--classes` 个数必须等于训练时的 `NUM_CLASSES`（默认 3） |
 | 推理后没有弹窗 | 无界面 / 远程会话，或加了 `--no-show` | 图片已保存到 `--output`，属正常行为 |
+| 自动分拣启动即报“模型文件不存在” | 权重未生成或 `--model` 路径写错 | 先训练 `model/best.pth`，或用 `--model` 指定；主程序在连接平台前就会退出 |
+| 对管位置到了但推杆不动 | 当前类别与对管不匹配、对管键名不符，或触发值与设备电平相反 | 用 `sub_mqtt.py` 看 `lzm1` 对管报文；核对 `config.SWITCH_*`；低电平用默认 `false`，高电平加 `--switch-value true` |
+| 一张图后连续推多次 | 设备持续上报同一对管状态，分拣按报文触发且无去抖 / 边沿检测 | 让设备只在状态变化时上报；或在设备侧 / 上位机增加去抖（当前未实现） |
+| 分拣时推错类别 | 图像未先于对管到达，使用了上一帧的 `current_class` | 检查上报顺序与图像 / 对管是否一一对应；必要时在设备侧保证先图后对管 |
+| Ctrl+C 后设备仍在运行 | 停止指令未送达或程序异常退出 | 正常退出会先取消定时器、等推杆拉回再发 `conveyor=stop`；若提示停止失败，人工断电确认 |
+| 分拣识别明显变慢 | CPU 推理、图片过大，或每帧重复加载模型 | 用 GPU；`--image-size` 与训练一致；`ConveyorSorter` 默认复用同一个 `ResNetPredictor`，只加载 / 预热一次 |
 
 自检顺序（推荐）：
 
@@ -795,9 +937,16 @@ python -m pytest -v
 2. `python .\scripts\predict_resnet.py --image <一张验证集图片> --no-show` —— 应打印“已加载模型”“预测类别”“各阶段耗时”，并生成 `model/predict_result.png`；
 3. 若预测类别与图片不符，先确认 `--arch` / `--image-size` / `--classes` 与训练时一致，再怀疑模型本身。
 
+自动分拣自检：
+
+1. `python -m pytest tests\test_sorter.py tests\test_sort_main.py tests\test_predictor.py` —— 验证推杆映射、动作时序、主程序装配与推理入口；
+2. 先按单图推理自检确认 `model/best.pth` 能正确识别；
+3. `python .\scripts\sort_conveyor.py --transport tcp --host 127.0.0.1 --port 21883 --sub bb --pub aa` 连本地 broker，MQTTX 同时订阅 `bb` / `aa` 观察图像与对管报文；
+4. 手动发一条对管报文（值需与 `--switch-value` 一致），确认对应推杆先推后拉、0.2 s 后补料；若不对，先核对 `first/second/third/fourth` 与现场接线。
+
 ---
 
-## 12. 从旧版本迁移
+## 13. 从旧版本迁移
 
 早期版本是根目录平铺的脚本，重构后对应关系如下：
 
@@ -813,6 +962,8 @@ python -m pytest -v
 | `ResNet.py` | `conveyor/resnet.py`（类名 `BasicBlock` / `Bottleneck` / `ResNet` 不变） |
 | 训练/验证脚本（根目录） | `conveyor/trainer.py` + `scripts/train_resnet.py` |
 | 单图推理脚本（根目录，`torch.load` + `plt.show`） | `conveyor/predictor.py` + `conveyor/profile.py` + `scripts/predict_resnet.py` |
+| `predict.py`（示例里的 `predict_resnet(image)`） | `conveyor/predictor.py` 的 `predict` / `predict_image` / `predict_base64` |
+| 自动分拣主程序（`hqyj_mqtt` + `predict.py`，全局变量 + `threading.Timer`） | `conveyor/sorter.py` + `scripts/sort_conveyor.py`（推杆 / 对管 / 延时集中在 `conveyor/config.py`） |
 | `./dataset_peach/train`、`./dataset_peach/valid` | `config.DATASET_SPLIT_ROOT`（默认 `dataset_split/train`、`dataset_split/valid`） |
 | `./dataset_peach/valid/.../imgN.jpg` 推理图片路径 | `--image` 参数（必填，支持中文路径） |
 | `./pre_model/*.pth`、`./model/*.pth` | 目录不变，但已被 `.gitignore` 忽略 |
@@ -832,7 +983,7 @@ from conveyor import config
 
 ---
 
-## 13. 设计要点与已知限制
+## 14. 设计要点与已知限制
 
 设计要点：
 
@@ -848,12 +999,17 @@ from conveyor import config
 - **可复现训练**：`setup_seed()` 同时固定 Python / Numpy / PyTorch / CUDA 种子，并设置 cudnn deterministic；DataLoader 训练集打乱、验证集保持顺序。
 - **验证集预处理**：只做 `Resize + Normalize`，不引入随机裁剪/翻转，保证每轮评估口径一致。
 - **产物隔离**：`pre_model/`、`model/` 与数据集一样被 `.gitignore` 忽略，仓库只保留代码与权重下载地址。
-- **中文路径**：图片落盘用 `cv2.imencode()` + `Path.write_bytes()`，读取用 `np.fromfile` + `cv2.imdecode()`；`cv2.imwrite()` / `cv2.imread()` 在 Windows 中文路径下会静默失败。
+- **中文路径**：图片落盘用 `cv2.imencode()` + `Path.write_bytes()`，读取用 `Path.read_bytes` + `cv2.imdecode()`；`cv2.imwrite()` / `cv2.imread()` 在 Windows 中文路径下会静默失败。
 - **推理权重严格加载**：单图推理的 `best.pth` 不存在时直接抛 `FileNotFoundError`，不像训练时那样回退随机初始化，避免用未训练权重输出“看似正常”的预测。
 - **预热只做一次**：`ResNetPredictor` 用 `warmed_up` 标记，只有首次 `predict()` 会执行预热；复用同一实例循环推理时，计时只反映预处理与前向。
 - **推理阶段不计梯度**：`eval()` + `torch.no_grad()`，固定 BN 统计量并降低显存占用。
 - **类别顺序一致**：`class_names` 默认取 `config.DATASET_CATEGORIES`，必须与训练时 `ImageFolder` 的目录升序（`half-ripe` / `raw` / `ripe`）一致，否则类别名会错位。
 - **计时口径统一**：加载模型 / 预处理 / 预热 / 推理四段全部用 `Profile` 测量；CUDA 可用时先 `synchronize()`，避免测到异步下发耗时。
+- **分拣映射集中**：推杆序号、对管键名、触发值和动作延时全部放在 `config.py`，`ConveyorSorter` 只接收映射，换接线无需改业务代码。
+- **对管按配置值触发**：只匹配“键存在且值等于 `switch_active_value`”的报文，不比较整个字典；同一报文带多个状态键时也不会误判。
+- **推杆定时器可取消**：每个 `threading.Timer` 都是 daemon 并登记在集合里；`close()` 先 `cancel()`，再等待正在执行的推杆拉回，避免退出时停在推出状态。
+- **分拣故障隔离**：图片解码 / 推理失败只跳过当前帧并保留上一次类别；单个推杆指令失败只记录日志，主循环继续消费报文。
+- **启动前置校验**：主程序先 `load_model()` 再连接平台，权重缺失时设备不会被启动；正常退出统一走 `close()` 停传送带并关闭 MQTT。
 
 已知限制：
 
@@ -863,11 +1019,14 @@ from conveyor import config
 - 设备侧行为（是否执行、执行结果）不在本仓库范围内，需结合设备固件与平台日志排查；
 - 训练只支持单标签三分类与固定输入尺寸，未实现早停、学习率调度、混合精度、k 折交叉验证；
 - 当前验证集与训练集同批次采集且仅 153 张，100% 准确率不代表跨批次泛化能力；
-- 单图推理只处理单张本地图片，未接入实时视频流 / MQTT 图片流的分拣闭环，也未导出 TorchScript / ONNX；批量场景需自行复用 `ResNetPredictor` 实例。
+- 自动分拣已支持 MQTT 图像 + 光电对管闭环，但同一时间只跟踪最近一帧类别，未做多目标队列 / 位置跟踪；图像与对管不是一一对应时可能用旧类别触发；
+- 推杆动作使用固定延时（wall clock），没有编码器 / 位置反馈，传送带速度变化会影响分拣落点；
+- 对管触发没有去抖与边沿检测，依赖设备只在状态变化时上报；持续上报同一状态会重复推杆；
+- 单张 base64 图片推理，未接入实时视频流 / 批量推理，也未导出 TorchScript / ONNX；批量场景需自行复用 `ResNetPredictor` 实例。
 
 ---
 
-## 14. 参考
+## 15. 参考
 
 - paho-mqtt 官方文档：<https://eclipse.dev/paho/files/paho.mqtt.python/html/index.html>
 - MQTT 5.0 规范：<https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html>

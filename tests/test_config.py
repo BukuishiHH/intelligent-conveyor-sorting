@@ -31,6 +31,22 @@ def test_command_constants():
     assert config.ROD_FIRST_PULL == "first_pull"
 
 
+def test_sorting_constants():
+    """ 自动分拣的推杆 / 对管 / 动作延时与示例代码一致 """
+    assert config.ROD_LOAD == "first"
+    assert config.ROD_RIPE == "second"
+    assert config.ROD_HALF_RIPE == "third"
+    assert config.ROD_RAW == "fourth"
+    assert config.ROD_ALL_PULL == "all_pull"
+    assert config.SWITCH_RIPE == "first_switch"
+    assert config.SWITCH_HALF_RIPE == "second_switch"
+    assert config.SWITCH_RAW == "third_switch"
+    assert config.SWITCH_ACTIVE_VALUE is False
+    assert config.ROD_PUSH_SECS == 1.0
+    assert config.ROD_RELOAD_DELAY_SECS == 0.2
+    assert config.ROD_START_DELAY_SECS == 0.5
+
+
 @pytest.fixture
 def fake_mqtt_clt(monkeypatch):
     """ 记录 create_client 传给 Mqtt_Clt 的参数 """
