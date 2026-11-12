@@ -680,20 +680,6 @@ print(result["class_name"], result["probability"], result["timings"])
 predictor.save_visualization(result["image"], result, show=True)
 ```
 
-### 8.5 与原始示例代码的差异
-
-| 原示例 | 本项目 | 原因 |
-| --- | --- | --- |
-| 固定 `resnet18()` 再手工替换 `fc` | `create_resnet(arch, num_classes)` 直接按分类数构建 | 与训练侧结构一致，同时支持 34 / 50 |
-| `torch.load(...)` 不指定 `map_location` | `load_state_dict(path, map_location=device)` | GPU 推理不必先落到 CPU 再搬运 |
-| `cv2.imread` 读图 | `Path.read_bytes` + `cv2.imdecode` | Windows 中文路径下 `imread` 会静默返回 `None` |
-| 内联 `Profile` 与 `plt.show()` | `conveyor/profile.py` 复用 + `save_visualization(show=False)` | 可单测、无界面环境也能出图 |
-| `classes` 字典写死 | `class_names` 默认取 `config.DATASET_CATEGORIES` | 类别与训练目录一处维护 |
-| 每次预测都预热 | `warmed_up` 标记，只预热一次 | 循环推理不重复付预热开销 |
-| 权重路径写死 | `--model` / `--arch` / `--image-size` 参数化 | 同一入口可验证不同轮次的权重 |
-
----
-
 ## 9. 自动分拣主程序
 
 `conveyor/sorter.py` 封装 `ConveyorSorter`，`scripts/sort_conveyor.py` 是主程序入口。它把前面几节串成闭环：**加载权重 → 连接平台 → 收图像报文并识别 → 按光电对管触发推杆 → 延时补料**。
@@ -798,22 +784,6 @@ try:
 finally:
     sorter.close()
 ```
-
-### 9.5 与原始示例代码的差异
-
-| 原示例 | 本项目 | 原因 |
-| --- | --- | --- |
-| `hqyj_mqtt.Mqtt_Clt` + 写死 `127.0.0.1:21883` / `bb -> aa` | `config.create_client()` + `--host/--port/--sub/--pub/--transport` | 同一入口既能连平台 wss，也能连本地 broker |
-| 外部 `predict_resnet(image)`，模型状态散落 | 复用 `ResNetPredictor.predict_base64()`，模型只加载、预热一次 | 循环识别不重复付加载 / 预热开销 |
-| 脚本里手写 base64 / `np.frombuffer` / `cv2.imdecode` | `predictor.decode_image()` + `predict_base64()` | 解码与 BGR→RGB 只维护一份 |
-| `result`、推杆名、对管名都是模块级全局变量 | `current_class` 与 `config.ROD_*` / `config.SWITCH_*` | 参数集中管理，便于换硬件接线 |
-| `ripe_switch == msg` 比较整个字典 | 按对管键 + 配置的触发值匹配 | 报文同时带多个键时不会误判 |
-| `threading.Timer` 创建后不跟踪 | daemon 定时器集中登记，退出时 `cancel()` 并等待在途推杆拉回 | Ctrl+C 后不会残留推杆动作或停在推出状态 |
-| Ctrl+C 直接退出，不停传送带 | `close()` 下发 `conveyor=stop` 并关闭 MQTT | 避免设备继续运行 |
-| 首次收到图片才发现权重不存在 | 主程序先 `load_model()`，失败则不连接平台 | 避免设备被启动后才发现无法识别 |
-| 无命令行参数 | `--model/--arch/--image-size/--classes/--device/--switch-value` | 同一入口适配不同权重与设备电平 |
-
----
 
 ## 10. 测试
 
@@ -946,44 +916,7 @@ python -m pytest -v
 
 ---
 
-## 13. 从旧版本迁移
-
-早期版本是根目录平铺的脚本，重构后对应关系如下：
-
-| 旧路径 | 新路径 |
-| --- | --- |
-| `MQTT_Clt.py` | `conveyor/mqtt_client.py`（类名仍为 `Mqtt_Clt`） |
-| `control_conveyor.py` | `scripts/control_conveyor.py` |
-| `control_rod_control.py` | `scripts/control_rod_control.py` |
-| `recv_msg.py` | `scripts/recv_msg.py` |
-| `pub_mqtt.py` | `scripts/pub_mqtt.py` |
-| `sub_mqtt.py` | `scripts/sub_mqtt.py` |
-| `hqyj_mqtt` 示例中的 `GetData`（外部教学代码） | `conveyor/dataset.py` + `scripts/get_dataset.py` |
-| `ResNet.py` | `conveyor/resnet.py`（类名 `BasicBlock` / `Bottleneck` / `ResNet` 不变） |
-| 训练/验证脚本（根目录） | `conveyor/trainer.py` + `scripts/train_resnet.py` |
-| 单图推理脚本（根目录，`torch.load` + `plt.show`） | `conveyor/predictor.py` + `conveyor/profile.py` + `scripts/predict_resnet.py` |
-| `predict.py`（示例里的 `predict_resnet(image)`） | `conveyor/predictor.py` 的 `predict` / `predict_image` / `predict_base64` |
-| 自动分拣主程序（`hqyj_mqtt` + `predict.py`，全局变量 + `threading.Timer`） | `conveyor/sorter.py` + `scripts/sort_conveyor.py`（推杆 / 对管 / 延时集中在 `conveyor/config.py`） |
-| `./dataset_peach/train`、`./dataset_peach/valid` | `config.DATASET_SPLIT_ROOT`（默认 `dataset_split/train`、`dataset_split/valid`） |
-| `./dataset_peach/valid/.../imgN.jpg` 推理图片路径 | `--image` 参数（必填，支持中文路径） |
-| `./pre_model/*.pth`、`./model/*.pth` | 目录不变，但已被 `.gitignore` 忽略 |
-
-导入方式变化：
-
-```python
-# 旧
-from MQTT_Clt import Mqtt_Clt
-
-# 新
-from conveyor.mqtt_client import Mqtt_Clt
-from conveyor import config
-```
-
-平台参数不再散落在各脚本里，统一在 `conveyor/config.py` 维护。
-
----
-
-## 14. 设计要点与已知限制
+## 13. 设计要点与已知限制
 
 设计要点：
 
@@ -1026,7 +959,7 @@ from conveyor import config
 
 ---
 
-## 15. 参考
+## 14. 参考
 
 - paho-mqtt 官方文档：<https://eclipse.dev/paho/files/paho.mqtt.python/html/index.html>
 - MQTT 5.0 规范：<https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html>
